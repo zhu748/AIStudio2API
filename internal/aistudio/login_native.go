@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyproto"
 )
 
 // NativeLoginDriver 通过纯 Go WebDriver BiDi 完成隔离登录
@@ -49,7 +50,7 @@ func (driver *NativeLoginDriver) Login(ctx context.Context, request IsolatedLogi
 	if driver == nil {
 		return IsolatedLoginResult{}, errors.New("纯 Go Camoufox 登录驱动未初始化")
 	}
-	result, err := camoufoxnative.Login(ctx, driver.options(request))
+	result, err := camoufoxnative.Login(ctx, driver.options(ctx, request))
 	if err != nil {
 		return IsolatedLoginResult{}, err
 	}
@@ -80,7 +81,7 @@ func (driver *NativeLoginDriver) Verify(ctx context.Context, request IsolatedLog
 	if err != nil {
 		return LoginVerification{}, fmt.Errorf("编码隔离验证状态: %w", err)
 	}
-	verification, err := camoufoxnative.Verify(ctx, driver.options(request), encoded)
+	verification, err := camoufoxnative.Verify(ctx, driver.options(ctx, request), encoded)
 	if err != nil {
 		return LoginVerification{}, err
 	}
@@ -91,13 +92,33 @@ func (driver *NativeLoginDriver) Verify(ctx context.Context, request IsolatedLog
 	}, nil
 }
 
-func (driver *NativeLoginDriver) options(request IsolatedLoginRequest) camoufoxnative.LoginOptions {
+func (driver *NativeLoginDriver) options(ctx context.Context, request IsolatedLoginRequest) camoufoxnative.LoginOptions {
 	return camoufoxnative.LoginOptions{
 		ExecutablePath: driver.camoufox,
 		Directory:      request.Directory,
 		Locale:         request.Locale,
 		Timezone:       request.Timezone,
-		Proxy:          request.Proxy,
+		Proxy:          browserLoginProxy(ctx, request.Proxy),
 		Timeout:        driver.timeout,
 	}
+}
+
+// browserLoginProxy 把登录代理转换为 Camoufox 可用形式:
+// vless/trojan/ss 分享链接在登录会话内架设 SOCKS5 桥(会话结束自动关闭),
+// 其余(http/https/socks5/空)原样返回。
+func browserLoginProxy(ctx context.Context, proxyURL string) string {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return ""
+	}
+	outbound, err := proxyproto.Parse(proxyURL)
+	if err != nil || outbound.IsStandard() {
+		return proxyURL
+	}
+	bridged, err := proxyproto.ServeSOCKS5(ctx, outbound)
+	if err != nil {
+		// 建桥失败时回退原 URL,由 Camoufox 报出明确错误
+		return proxyURL
+	}
+	return bridged
 }

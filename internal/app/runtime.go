@@ -18,6 +18,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyproto"
 )
 
 // newRuntime 装配单个生成服务实例
@@ -132,6 +133,9 @@ type accountWorkerManager struct {
 	lifecycle       context.Context
 	cancel          context.CancelFunc
 	closed          bool
+
+	proxyBridgesMu sync.Mutex
+	proxyBridges   map[string]string // 分享链接 URL → 本地 socks5 桥地址
 }
 
 type accountWorker struct {
@@ -464,6 +468,36 @@ func (manager *accountWorkerManager) workerConfig(account *aistudio.Account) cam
 	return manager.workerConfigFor(account, account.Config)
 }
 
+// browserProxy 把代理 URL 转换为浏览器可用的形式:
+// vless/trojan/ss 分享链接在进程内架设 SOCKS5 桥后返回桥地址,
+// 其余(http/https/socks5/空)原样返回。
+// 桥按分享链接 URL 复用,生命周期绑定 manager(停机时监听器自动关闭)。
+func (manager *accountWorkerManager) browserProxy(proxyURL string) string {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return ""
+	}
+	outbound, err := proxyproto.Parse(proxyURL)
+	if err != nil || outbound.IsStandard() {
+		return proxyURL
+	}
+	manager.proxyBridgesMu.Lock()
+	defer manager.proxyBridgesMu.Unlock()
+	if manager.proxyBridges == nil {
+		manager.proxyBridges = make(map[string]string)
+	}
+	if bridged, exists := manager.proxyBridges[outbound.Raw()]; exists {
+		return bridged
+	}
+	bridged, err := proxyproto.ServeSOCKS5(manager.lifecycle, outbound)
+	if err != nil {
+		// 建桥失败时回退原 URL,由 Camoufox 报出明确错误
+		return proxyURL
+	}
+	manager.proxyBridges[outbound.Raw()] = bridged
+	return bridged
+}
+
 func (manager *accountWorkerManager) workerConfigFor(
 	account *aistudio.Account,
 	config aistudio.AccountConfig,
@@ -472,6 +506,7 @@ func (manager *accountWorkerManager) workerConfigFor(
 	if proxy == "" {
 		proxy = strings.TrimSpace(manager.globalProxy)
 	}
+	proxy = manager.browserProxy(proxy)
 	return camoufoxnative.Options{
 		ExecutablePath:   manager.camoufox,
 		StorageStatePath: account.StoragePath,

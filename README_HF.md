@@ -8,6 +8,7 @@
 
 | 维度 | 设计 |
 |------|------|
+| 代理协议 | PROXY 与账号级 proxy 除 http/https/socks5 外,直接支持 **vless:// / trojan:// / ss://** 分享链接;浏览器流量经进程内 SOCKS5 桥自动转换(见三-B 节) |
 | 凭证注入 | **推荐**每账号一个编号变量 `AISTUDIO_AUTH_ACCOUNT_1`..`_N`（可直接粘贴 storage-state.json 文件内容），或数组变量 `AISTUDIO_AUTH_ACCOUNTS` 打包全部账号；两种方式互斥，均支持 `base64:` / `gzip:` 前缀 |
 | 多账号 | 启动时把所有账号写入 `/app/auth/<email>/`，AccountStore 自动加载 |
 | 单账号在线 | 默认仅 `AISTUDIO_ACTIVE_EMAIL`（或第一个）账号 `Enabled=true`，其余 `Enabled=false` |
@@ -183,6 +184,46 @@ wc -c /tmp/auth_accounts.json
 | `gzip:` | -60%~80% | **多账号超 64KB 时首选** | `echo "gzip:$(gzip -c /tmp/auth_accounts.json \| base64 -w0)"` |
 
 gzip 实测压缩率：1.5KB → 412B（约 73% 压缩）。多账号场景几乎都能压到 64KB 以内。
+
+---
+
+## 三-B、代理直接填分享链接(vless / trojan / ss)
+
+`PROXY` 环境变量与账号级 `proxy` 字段除了 http/https/socks5,现在可以直接粘贴
+机场或自建节点导出的分享链接,**无需再在宿主机跑 sing-box/xray 转换层**:
+
+```
+PROXY=vless://b831381d-xxxx@1.2.3.4:443?security=tls&sni=cdn.example.com&type=ws&host=cdn.example.com&path=%2Fws
+PROXY=trojan://password@1.2.3.4:443?sni=example.com
+PROXY=ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388
+```
+
+支持范围:
+
+| 协议 | 传输 | 安全层 | 说明 |
+|------|------|--------|------|
+| `vless://` | tcp / ws | none / tls | 机场最主流;uuid 即 userinfo |
+| `trojan://` | tcp / ws | tls(默认) / none | password 即 userinfo,SHA224 认证 |
+| `ss://` | tcp | 内建 AEAD | aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305;支持 SIP002 与旧式整体 base64 两种链接 |
+
+常用参数(三协议通用):`sni`(TLS 域名)、`type=ws&path=/xx&host=xx`(WebSocket 伪装)、
+`allowInsecure=1`(跳过证书校验,仅测试)。
+
+**工作原理**:
+- API 出站流量:拨号器直接实现协议,无额外进程;
+- **Camoufox 浏览器流量**:浏览器引擎只认 http/socks,程序会在进程内自动架设一个
+  仅监听 127.0.0.1 的 SOCKS5 桥,把分享链接转换后喂给浏览器,登录页/WAA 预热同样走节点;
+- 每个不同的分享链接一个桥,按需复用,随服务停止自动关闭。
+
+**暂不支持**(填入会启动报错并给出替代建议):
+- `vmess://`——协议陈旧且客户端实现风险高,请把节点换成 VLESS/Trojan/SS,
+  或本机跑 sing-box 转 socks5 后填 `socks5://127.0.0.1:端口`;
+- VLESS `REALITY`(`security=reality`)与 `flow`(xtls-rprx-vision 系)——请在
+  节点服务端改为普通 TLS;
+- `hysteria2/tuic` 等 QUIC 系协议、SS2022(blake3 系 method)、SIP003 plugin(obfs 等)。
+
+多账号场景推荐:每个账号凭证配不同节点的 proxy(见第三章包装对象 `proxy` 字段),
+出口 IP 差异化能显著降低 Google 风控。
 
 ---
 
@@ -404,9 +445,20 @@ curl https://<你的用户名>-aistudio2api.hf.space/v1/chat/completions \
 ### Q4: 账号频繁进入 `auth_required` 状态
 
 HF Spaces 是共享 IP，Google 容易识别为自动化流量。建议：
-1. 在 Variables 中配置 `PROXY` 为住宅代理
+1. 在 Variables 中配置 `PROXY`——住宅代理(http/socks5)或机场节点
+   (vless/trojan/ss 分享链接,见三-B 节)
 2. 开启 `AISTUDIO_FAILOVER=true` 自动切换备用账号
 3. 或迁到 VPS 部署（参考主 README）
+
+### Q4b: 填了 vless:// 链接后启动报错
+
+错误信息会写明原因与替代方案,常见:
+- `vmess:// 暂不支持` → 节点换 VLESS/Trojan,或本机 sing-box 转 socks5
+- `VLESS REALITY 暂不支持` → 服务端 security 改 tls
+- `flow 暂不支持` → 服务端去掉 flow(xtls-rprx-vision)
+- `SS2022 ... 暂不支持` → 服务端 method 改 aes-256-gcm/chacha20-ietf-poly1305
+- `传输层 grpc 暂不支持` → 服务端 type 改 ws 或 tcp
+- 桥相关的连接失败 → 检查节点本身可用性(先用 sing-box/客户端手动连一次)
 
 ### Q5: 如何查看实时日志
 
@@ -476,7 +528,51 @@ echo "gzip:$(gzip -c auth-xxx.json | base64 -w0)"
 
 ---
 
-## 九、文件清单
+## 九、Cloudflare Worker 自定义域名转发
+
+不想用 HuggingFace 分配的 `*.hf.space` 域名?仓库自带 Worker 脚本
+(`deploy/cloudflare-worker.js`),把**自有域名**的流量反代到 Space:
+
+| 收益 | 说明 |
+|------|------|
+| 自定义域名 | `api.yourdomain.com` 代替 `xxx-yyy.hf.space` |
+| 隐藏真实地址 | Space 域名不再对外暴露,降低被扫/白嫖 |
+| 网络中继 | HF 域名在部分地区不可达时,Cloudflare 边缘节点通常可达 |
+| 边缘鉴权(可选) | 设置 `ACCESS_KEY`,错误密钥在边缘 401,不消耗 HF 配额 |
+
+### 部署步骤(全程网页操作,免费)
+
+1. **创建 Worker**:Cloudflare Dashboard → Workers & Pages → Create → Worker,
+   名字随意(如 `aistudio2api-proxy`),Deploy 后进入编辑器,
+   把 `deploy/cloudflare-worker.js` 内容整份粘贴覆盖,保存部署;
+2. **配置上游**:Worker → Settings → Variables and Secrets → 添加
+   - `UPSTREAM`(Variable)= `https://<你的用户名>-<space名>.hf.space`(末尾不带 /)
+   - `ACCESS_KEY`(Secret,可选)= 自拟随机串;开启后请求需带
+     `Authorization: Bearer <key>` 或 `X-Access-Key: <key>`
+3. **绑定域名**:Worker → Settings → Domains & Routes → Add → Custom Domain,
+   填 `api.yourdomain.com`(域名 DNS 需托管在同一 Cloudflare 账号,自动加记录);
+   没有域名也可临时用 `xxx.workers.dev` 测试;
+4. **验证**:
+   ```bash
+   curl https://api.yourdomain.com/health
+   curl https://api.yourdomain.com/v1/models -H "Authorization: Bearer <PROXY_API_KEY>"
+   ```
+
+之后第三方客户端 Base URL 填 `https://api.yourdomain.com/v1` 即可。
+
+### 已处理的细节
+
+- **流式 SSE**:响应体按流透传,`/v1/chat/completions` 的 stream 输出不受影响;
+- **WebSocket**:升级请求直接透传(管理界面实时日志用);
+- **鉴权头透传**:边缘 `ACCESS_KEY` 校验通过后,`Authorization` 原样转发,
+  与后端 `PROXY_API_KEY` / `ADMIN_TOKEN` 互不干扰、可独立轮换;
+- **HF 的 Set-Cookie 不写入自有域**;Cloudflare 注入的 `cf-*` 头会在转发前剥除;
+- **限额提醒**:免费 Workers 10 万请求/天、请求体 100MB、CPU 10ms——
+  对 API 转发绰绰有余,但**不要**用它跑批量图片/视频生成任务。
+
+---
+
+## 十、文件清单
 
 本次改造涉及的文件：
 
@@ -496,4 +592,6 @@ echo "gzip:$(gzip -c auth-xxx.json | base64 -w0)"
 | `.github/workflows/huggingface-sync.yml` | 新增 | CI: 幂等创建 HF Space（private + Docker SDK）并强推源码，支持手动/链式触发 |
 | `.dockerignore` | 新增 | 排除运行时数据和构建产物 |
 | `.env.example` | 修改 | 增加 HF 部署相关变量说明（`ADMIN_TOKEN`、`AISTUDIO_FAILOVER` 等） |
+| `internal/proxyproto/` | 新增 | vless/trojan/ss 分享链接解析与拨号(TCP/WS/TLS/SS AEAD),进程内 SOCKS5 桥 |
+| `deploy/cloudflare-worker.js` | 新增 | Cloudflare Worker 反代脚本(自定义域名/边缘鉴权/SSE 流式) |
 | `README_HF.md` | 新增 | 本文档 |

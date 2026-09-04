@@ -19,6 +19,8 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 	tls "github.com/bogdanfinn/utls"
 	"golang.org/x/net/proxy"
+
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyproto"
 )
 
 const browserProxyConnectTimeout = 30 * time.Second
@@ -56,13 +58,29 @@ type browserConnectDialer struct {
 	direct      *net.Dialer
 }
 
+// outboundContextDialer 把 proxyproto.Outbound 适配为 proxy.ContextDialer
+type outboundContextDialer struct {
+	outbound *proxyproto.Outbound
+}
+
+func (d outboundContextDialer) Dial(network, address string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, address)
+}
+
+func (d outboundContextDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return d.outbound.DialContext(ctx, network, address)
+}
+
 type browserResponseBody struct {
 	body    io.ReadCloser
 	source  *fhttp.Response
 	trailer stdhttp.Header
 }
 
-// newBrowserRoundTripper 创建与当前 Camoufox 网络形状一致的传输
+// newBrowserRoundTripper 创建与当前 Camoufox 网络形状一致的传输。
+//
+// 代理支持:http/https/socks5,以及 vless:// / trojan:// / ss:// 分享链接
+// (后三者由 proxyproto 包直接拨号,详见其包注释中的支持范围)
 func newBrowserRoundTripper(proxyURL string) (stdhttp.RoundTripper, error) {
 	proxyURL = strings.TrimSpace(proxyURL)
 	var proxyDialer proxy.ContextDialer
@@ -73,12 +91,20 @@ func newBrowserRoundTripper(proxyURL string) (stdhttp.RoundTripper, error) {
 		}
 		switch strings.ToLower(parsed.Scheme) {
 		case "http", "https", "socks5":
+		case "vless", "trojan", "ss":
+			outbound, parseErr := proxyproto.Parse(proxyURL)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			proxyDialer = outboundContextDialer{outbound: outbound}
 		default:
-			return nil, fmt.Errorf("代理协议必须是 http、https 或 socks5")
+			return nil, fmt.Errorf("代理协议必须是 http、https、socks5、vless、trojan 或 ss")
 		}
-		proxyDialer, err = newBrowserProxyDialer(parsed)
-		if err != nil {
-			return nil, err
+		if proxyDialer == nil {
+			proxyDialer, err = newBrowserProxyDialer(parsed)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	options := []tlsclient.HttpClientOption{
