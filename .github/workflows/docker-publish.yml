@@ -8,15 +8,6 @@ on:
   push:
     branches: [main, master]
     tags: ['v*']
-    paths:
-      - 'Dockerfile'
-      - '.dockerignore'
-      - '.github/workflows/docker-publish.yml'
-      - 'cmd/**'
-      - 'internal/**'
-      - 'web/**'
-      - 'go.mod'
-      - 'go.sum'
   workflow_dispatch:
     inputs:
       ref:
@@ -55,7 +46,6 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ github.repository_owner }}/aistudio2api
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -69,13 +59,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub (optional)
-        if: ${{ vars.DOCKERHUB_USERNAME != '' }}
-        uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
         id: build

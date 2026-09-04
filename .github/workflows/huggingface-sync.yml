@@ -7,7 +7,6 @@ name: Sync to HuggingFace Space
 #   - HF_TOKEN: HuggingFace Access Token(需 write 权限)
 # 必需 Variables(在 Settings → Secrets → Variables for Actions 添加):
 #   - HF_SPACE_OWNER: HF 用户名或组织名(例如 your-username)
-#   - HF_SPACE_NAME: Space 名称(默认 aistudio2api)
 #
 # 触发:
 #   - docker-publish 工作流完成后自动调用
@@ -63,55 +62,42 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Configure git
+      - name: Remove git history
         if: steps.check.outputs.skip != 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Remove git history artifacts
-        if: steps.check.outputs.skip != 'true'
-        run: |
-          # 移除 .git 历史等不需要同步的内容(后续会重新 init)
-          rm -rf .git
+        run: rm -rf .git
 
       - name: Prepare HF Space metadata
         if: steps.check.outputs.skip != 'true'
         run: |
-          # HF Spaces 通过 README.md 顶部的 YAML frontmatter 配置 SDK
-          # 如果没有 frontmatter,创建一个
           if [ ! -f README.md ] || ! head -1 README.md | grep -q '^---$'; then
-            cat > /tmp/hf_header.md <<'EOF'
-            ---
-            title: AIStudio2API
-            emoji: 🤖
-            colorFrom: blue
-            colorTo: green
-            sdk: docker
-            sdk_version: latest
-            app_port: 7860
-            pinned: false
-            license: mit
-            ---
-            EOF
-            cat /tmp/hf_header.md README.md > README.md.new 2>/dev/null || mv /tmp/hf_header.md README.md.new
+            cat > README.md.new <<'EOF'
+          ---
+          title: AIStudio2API
+          emoji: 🤖
+          colorFrom: blue
+          colorTo: green
+          sdk: docker
+          sdk_version: latest
+          app_port: 7860
+          pinned: false
+          license: mit
+          ---
+          EOF
+            cat README.md >> README.md.new 2>/dev/null || true
             mv README.md.new README.md
           else
-            # 已有 frontmatter, 确保 sdk: docker 和 app_port: 7860
             python3 <<'PY'
-            import re
-            with open('README.md') as f:
-                content = f.read()
-            # 确保 sdk: docker
-            content = re.sub(r'sdk:\s*\w+', 'sdk: docker', content, count=1)
-            # 确保 app_port: 7860
-            if 'app_port:' not in content:
-                content = content.replace('sdk: docker', 'sdk: docker\napp_port: 7860', 1)
-            else:
-                content = re.sub(r'app_port:\s*\d+', 'app_port: 7860', content)
-            with open('README.md', 'w') as f:
-                f.write(content)
-            PY
+          import re
+          with open('README.md') as f:
+              content = f.read()
+          content = re.sub(r'sdk:\s*\w+', 'sdk: docker', content, count=1)
+          if 'app_port:' not in content:
+              content = content.replace('sdk: docker', 'sdk: docker\napp_port: 7860', 1)
+          else:
+              content = re.sub(r'app_port:\s*\d+', 'app_port: 7860', content)
+          with open('README.md', 'w') as f:
+              f.write(content)
+          PY
           fi
           echo "=== README.md frontmatter ==="
           head -20 README.md
@@ -137,7 +123,6 @@ jobs:
             echo "::warning::没有改动可提交"
             exit 0
           }
-          # 强制推送覆盖 HF Space 仓库(以 GitHub 为准)
           git push -f space main
 
       - name: Summary
