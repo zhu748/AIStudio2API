@@ -55,6 +55,9 @@ jobs:
       - name: Go build
         run: go build ./...
 
+      - name: Go test
+        run: go test ./... -count=1
+
       - name: Frontend install
         working-directory: web
         run: npm ci

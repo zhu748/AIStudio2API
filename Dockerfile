@@ -31,6 +31,11 @@ RUN cd web && npm run build && test -f /src/internal/webui/dist/index.html
 # =============================== builder stage ===============================
 FROM golang:1.26-bookworm AS builder
 
+# BuildKit 自动注入 TARGETARCH(与目标平台一致);
+# 经典构建器不注入时回退到基础镜像自身架构,保证本地 docker build
+# 在任何宿主机上都能产出与基础镜像架构一致的二进制
+ARG TARGETARCH
+
 WORKDIR /src
 
 # 先复制模块文件,仅当 go.mod/go.sum 变化时才重新下载依赖(层缓存)
@@ -42,16 +47,26 @@ COPY . .
 COPY --from=frontend /src/internal/webui/dist ./internal/webui/dist
 
 # 构建后端二进制(纯静态,CGO 关闭;modernc.org/sqlite 为纯 Go 实现)
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(dpkg --print-architecture)} \
     go build -trimpath -ldflags="-s -w" -o /out/aistudio2api ./cmd/aistudio2api
 
 # ============================= camoufox stage =============================
 FROM ubuntu:22.04 AS camoufox
 
+# 架构护栏: Camoufox 官方仅发布 linux x86_64 构建,在非 amd64 平台
+# 构建时快速失败并给出明确错误,而不是产出二进制与基础镜像架构
+# 不符的静默损坏镜像(例如 Apple Silicon 上本地 docker build)
+ARG TARGETARCH
+
 # 从源码动态读取 Camoufox 版本,避免与代码常量不同步
 # 内部/camoufoxnative/download.go 中: const camoufoxRelease = "152.0.4-beta.29"
 COPY internal/camoufoxnative/download.go /tmp/download.go
-RUN apt-get update && \
+RUN BUILD_ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    if [ "$BUILD_ARCH" != "amd64" ]; then \
+        echo "ERROR: 暂不支持 linux/$BUILD_ARCH——Camoufox 官方未发布 linux aarch64 构建,请使用 --platform linux/amd64" >&2; \
+        exit 1; \
+    fi && \
+    apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl unzip grep && \
     rm -rf /var/lib/apt/lists/* && \
     CAMOUFOX_VERSION=$(grep -oE 'camoufoxRelease = "[^"]+"' /tmp/download.go | head -1 | sed -E 's/.*"([^"]+)".*/\1/') && \

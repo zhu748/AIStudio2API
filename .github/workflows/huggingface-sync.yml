@@ -146,11 +146,15 @@ jobs:
 
       - name: Initialize HF Space repo
         if: steps.check.outputs.skip != 'true'
+        env:
+          # token 走环境变量而非 ${{ }} 内插,避免出现在 shell 命令行
+          # (GitHub 会掩码日志,但进程列表/错误堆栈仍是泄漏面)
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           git init
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add space "https://user:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/${HF_SPACE_REPO}"
+          git remote add space "https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE_REPO}"
           git checkout -b main
 
       - name: Commit and force-push

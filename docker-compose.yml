@@ -45,7 +45,8 @@ services:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7860/health"]
       interval: 30s
       timeout: 10s
-      start_period: 120s
+      # 与 Dockerfile HEALTHCHECK 一致: Camoufox 首次预热可能超 120s
+      start_period: 180s
       retries: 3
     deploy:
       resources:

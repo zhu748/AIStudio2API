@@ -79,10 +79,16 @@ jobs:
             BUILDKIT_INLINE_CACHE=1
 
       - name: Generate image digest summary
+        # 注意: metadata-action 输出的 tag 中镜像名已小写化(GHCR 要求
+        # 全小写),此处展示与拉取命令也必须用小写名,否则用户会拉取
+        # 不存在的 ghcr.io/zhu748/AIStudio2API (大小写敏感)
+        env:
+          FULL_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
+          IMAGE_LC="${FULL_IMAGE,,}"
           echo "## Docker Image Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${IMAGE_LC}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -101,7 +107,7 @@ jobs:
           echo "  -e AISTUDIO_AUTH_ACCOUNTS='gzip:...' \\" >> $GITHUB_STEP_SUMMARY
           echo "  -e PROXY_API_KEY=your-key \\" >> $GITHUB_STEP_SUMMARY
           echo "  -e ADMIN_TOKEN=your-admin-token \\" >> $GITHUB_STEP_SUMMARY
-          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "  ${IMAGE_LC}:latest" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Sync to HuggingFace Space

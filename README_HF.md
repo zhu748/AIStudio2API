@@ -12,7 +12,7 @@
 | 多账号 | 启动时把所有账号写入 `/app/auth/<email>/`，AccountStore 自动加载 |
 | 单账号在线 | 默认仅 `AISTUDIO_ACTIVE_EMAIL`（或第一个）账号 `Enabled=true`，其余 `Enabled=false` |
 | 账号切换 | 复用 Web 管理界面"账户"页：停用当前账号 → 启用目标账号，无需重启；或通过 `PUT /api/accounts/{id}` API |
-| 自动 failover | `AISTUDIO_FAILOVER=true` 时后台监控 active 账号失效，自动切换到备用账号（失效账号拉黑防震荡） |
+| 自动 failover | `AISTUDIO_FAILOVER=true` 时后台监控 active 账号失效，自动切换到备用账号（失效账号拉黑防震荡，切换中断时自愈重试） |
 | 管理端鉴权 | `ADMIN_TOKEN` 非空时启用 token 鉴权（HF 必填，否则管理操作被 loopback 限制 403） |
 | 监听端口 | `0.0.0.0:7860`（HF Spaces 强制端口） |
 | 健康检查 | `/health` 在服务未就绪时返回 503，避免 HF 提前路由流量导致 502 |
@@ -165,7 +165,7 @@ gzip 实测压缩率：1.5KB → 412B（约 73% 压缩）。多账号场景几�
 
 ```
 push/PR
-  └─ ci.yml              PR 质量门禁: go vet + go build + 前端 vue-tsc 类型检查
+  └─ ci.yml              PR 质量门禁: go vet + go build + go test + 前端 vue-tsc 类型检查
 
 push/手动触发
   └─ docker-publish.yml   构建 Docker 镜像 → 推送 ghcr.io/<owner>/aistudio2api
@@ -282,6 +282,7 @@ curl -X PUT "https://<user>-aistudio2api.hf.space/api/accounts/account2@gmail.co
 - 自动禁用当前账号，并将其拉黑（本进程内不再选中，防止失效账号被反复启用震荡切换）
 - 自动启用列表中下一个未被拉黑的备用账号
 - 若备用账号启用后也失效，下一轮检查会继续切换，最终收敛到健康账号
+- 若切换中途失败（如禁用旧账号后、启用备用前出错），下一轮自愈重试启用备用账号，不会卡死在零可用状态
 - 全程无需人工干预；进程重启后拉黑状态清零、账号状态从环境变量重新注入
 
 ### 重启后行为
@@ -416,6 +417,7 @@ echo "gzip:$(gzip -c /tmp/auth.json | base64 -w0)"
 - 查看日志中是否有 `触发自动账号切换` 字样
 - failover 每 30 秒检查一次，最多有 30s 延迟
 - 若日志出现 `failover 无可用备用账号`，说明所有备用账号均已失效，需更新 `AISTUDIO_AUTH_ACCOUNTS` 后重启 Space
+- 若切换中途失败，下一轮（30s 后）会自愈重试；若日志出现 `failover 自愈失败: 无可用备用账号`，同样需要更新账号后重启
 
 ### Q10: 健康检查返回 503
 
@@ -433,13 +435,14 @@ echo "gzip:$(gzip -c /tmp/auth.json | base64 -w0)"
 | 文件 | 状态 | 说明 |
 |------|------|------|
 | `internal/app/auth_env.go` | 新增 | 环境变量凭证注入,支持 JSON/base64/gzip 三种编码 |
-| `internal/app/failover.go` | 新增 | active 账号失效自动切换监控 |
+| `internal/app/failover.go` | 新增 | active 账号失效自动切换监控（含切换中断自愈） |
+| `internal/app/failover_test.go` | 新增 | failover 行为单元测试（防震荡/自愈/字段保留等 9 个用例） |
 | `internal/app/app.go` | 修改 | 调用 `setupAuthFromEnv`、`startFailoverMonitor`，`rootHandler` 加 `ADMIN_TOKEN` |
 | `internal/api/router.go` | 修改 | `Config` 增加 `AdminToken` 字段，`/api/*` 改用 `adminAuthMiddleware` |
 | `internal/api/middleware.go` | 修改 | 新增 `AdminAuthMiddleware`（X-Admin-Token / Basic Auth / ?admin_token=） |
 | `internal/api/admin.go` | 修改 | `/health` 智能返回 503（服务未就绪时） |
 | `Dockerfile` | 新增 | 四阶段构建（node:24 官方镜像/Go/Camoufox 预下载/runtime），非 root UID 1000 运行 |
-| `.github/workflows/ci.yml` | 新增 | CI: PR 质量门禁（go vet/build + 前端类型检查） |
+| `.github/workflows/ci.yml` | 新增 | CI: PR 质量门禁（go vet/build/test + 前端类型检查） |
 | `.github/workflows/docker-publish.yml` | 新增 | CI: 构建镜像推送 GHCR，并通过 workflow_call 链式触发 HF 同步 |
 | `.github/workflows/huggingface-sync.yml` | 新增 | CI: 幂等创建 HF Space（private + Docker SDK）并强推源码，支持手动/链式触发 |
 | `.dockerignore` | 新增 | 排除运行时数据和构建产物 |
