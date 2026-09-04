@@ -83,6 +83,42 @@ RUN BUILD_ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     chmod +x /camoufox/camoufox-bin && \
     test -x /camoufox/camoufox-bin
 
+# ============================= singbox stage =============================
+# 预置 sing-box 转换层:第 2 级代理协议(vmess / VLESS REALITY + vision /
+# hysteria / hysteria2 / tuic / anytls / SS2022 / SIP003 plugin / grpc 等
+# 进阶传输)由 internal/sidecar 在运行时按需拉起该子进程承载,转换为
+# 本地 SOCKS5 供浏览器与出站请求使用(镜像内即开即用,无需出网下载)
+FROM ubuntu:22.04 AS singbox
+
+# 与 camoufox stage 相同的架构护栏:本镜像 runtime 依赖 Camoufox
+# (官方仅 linux x86_64),整体镜像仅支持 amd64
+ARG TARGETARCH
+
+# 从源码动态读取 sing-box 版本与 sha256,避免与 internal/sidecar/binary.go
+# 的常量不同步(运行时自动下载路径校验的是同一组 checksum)
+COPY internal/sidecar/binary.go /tmp/binary.go
+RUN BUILD_ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    if [ "$BUILD_ARCH" != "amd64" ]; then \
+        echo "ERROR: 暂不支持 linux/$BUILD_ARCH——请使用 --platform linux/amd64" >&2; \
+        exit 1; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    SINGBOX_VERSION=$(grep -oE 'singboxVersion = "[^"]+"' /tmp/binary.go | head -1 | sed -E 's/.*"([^"]+)".*/\1/') && \
+    SINGBOX_SHA=$(grep -oE '"linux-amd64": "[0-9a-f]{64}"' /tmp/binary.go | grep -oE '[0-9a-f]{64}') && \
+    test -n "$SINGBOX_VERSION" && test -n "$SINGBOX_SHA" && \
+    echo "sing-box version: $SINGBOX_VERSION" && \
+    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+      --silent --show-error \
+      -o /tmp/singbox.tar.gz \
+      "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz" && \
+    echo "${SINGBOX_SHA}  /tmp/singbox.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/singbox.tar.gz -C /tmp && \
+    install -m 0755 /tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box /usr/local/bin/sing-box && \
+    rm -rf /tmp/singbox.tar.gz /tmp/sing-box-* /tmp/binary.go && \
+    /usr/local/bin/sing-box version | head -1
+
 # ============================= runtime stage =============================
 FROM ubuntu:22.04 AS runtime
 
@@ -118,12 +154,16 @@ RUN useradd --uid 1000 --user-group --create-home --shell /usr/sbin/nologin appu
 
 WORKDIR /app
 
-# 拷贝二进制与 Camoufox
+# 拷贝二进制、Camoufox 与 sing-box 转换层(/usr/local/bin/sing-box 是
+# internal/sidecar 二级发现顺序中的预置路径,非 root 用户同样可执行)
 # 注意: --chown 自 Docker 17.09 起被经典构建器支持;但 --chmod 是 BuildKit
 # 专属特性,为确保 HF Spaces 构建器兼容性,可执行位用 RUN chmod 设置
 COPY --from=builder /out/aistudio2api /app/aistudio2api
 COPY --from=camoufox --chown=1000:1000 /camoufox /app/runtime/camoufox
-RUN chmod +x /app/aistudio2api /app/runtime/camoufox/camoufox-bin
+COPY --from=singbox /usr/local/bin/sing-box /usr/local/bin/sing-box
+# 顺带运行一次 sing-box version 验证二进制架构匹配,防止静默损坏
+RUN chmod +x /app/aistudio2api /app/runtime/camoufox/camoufox-bin \
+    && /usr/local/bin/sing-box version >/dev/null
 
 # 运行时可写目录:账户配置/凭证(runtime-state、.leases 均在 auth 下);
 # runtime 授权保证 CAMOUFOX_PATH 失效时的自动安装回退路径可写;

@@ -1,27 +1,33 @@
-// Package proxyproto 解析 VLESS / Trojan / Shadowsocks 分享链接并建立
-// 到代理服务器的拨号通道。
+// Package proxyproto 解析主流代理协议分享链接并建立到代理服务器的
+// 拨号通道。
 //
 // 设计目标:让 PROXY 与账号级 proxy 字段除了 http/https/socks5 之外,
-// 还能直接填写 vless:// / trojan:// / ss:// 分享链接(机场或自建节点
-// 的标准导出格式),无需在宿主机额外运行 sing-box/xray 转换层。
+// 还能直接填写机场或自建节点导出的分享链接,无需在宿主机额外
+// 运行 sing-box/xray 转换层。
 //
-// 支持范围(按传输与安全参数):
+// 处理方式分两级:
 //
-//	协议     传输              安全层
-//	vless    tcp / ws          none / tls
-//	trojan   tcp / ws          tls(默认) / none
-//	ss       tcp               内建 AEAD 加密
+//  1. 进程内原生拨号(零依赖,基于标准库 crypto/tls/aead/hkdf):
 //
-// 明确不支持并会在解析时报错的参数(报错信息会给出替代建议):
-//   - VLESS 的 REALITY(security=reality)、flow(xtls-rprx-vision 等)
-//   - VMess(vmess:// 分享链接)——协议陈旧且客户端实现风险高,
-//     请把节点换成 VLESS/Trojan/SS,或本机跑 sing-box 转 socks5 后填 socks5://
-//   - hysteria2 / tuic 等 QUIC 系协议(同上,可用 sing-box 转换)
-//   - SS2022(blake3 系列 method)、SIP003 plugin(obfs/v2ray-plugin)
-//   - grpc / httpupgrade / kcp 等其余传输
+//     协议     传输              安全层
+//     vless    tcp / ws          none / tls
+//     trojan   tcp / ws          tls(默认) / none
+//     ss       tcp               内建 AEAD 加密
 //
-// 实现全部基于标准库(crypto/tls、crypto/aead、crypto/hkdf),
-// 不引入任何第三方依赖,拨号实现满足 context 取消语义。
+//  2. sing-box 转换层(internal/sidecar 拉起 sing-box 子进程转本地 socks5):
+//     以下链接解析为 SidecarNode,由调用方交给 internal/sidecar 承载:
+//
+//     vmess(全部 cipher/传输)、vless REALITY / xtls-rprx-vision /
+//     grpc / httpupgrade / h2 / quic 传输、trojan grpc 系传输、
+//     SS2022(2022-blake3)、SIP003 plugin、hysteria2(hy2)、
+//     hysteria v1、tuic v5、anytls
+//
+// 明确不支持并会在解析时报错的项(报错信息会给出替代建议):
+//   - ssr / juicity / snell / brook / wireguard 等长尾协议
+//   - kcp(mkcp)与 splithttp(xhttp)传输(sing-box 不支持)
+//
+// 原生拨号实现满足 context 取消语义;Parse 只做语法与支持范围校验,
+// 不发起任何网络请求。
 package proxyproto
 
 import (
@@ -44,23 +50,39 @@ const dialTimeout = 30 * time.Second
 
 // Outbound 表示一个解析完成的代理出站:既能给出原始 URL(供日志与
 // 桥注册表去重),又能直接作为 context dialer 使用。
+//
+// 当链接属于第 2 级支持(sing-box 转换层)时 dial 为空、sidecar 非空,
+// 调用方应通过 NeedsSidecar 判定后交给 internal/sidecar 拉起子进程。
 type Outbound struct {
 	raw      string
 	scheme   string
 	standard bool
 	dial     func(ctx context.Context, network, address string) (net.Conn, error)
+	sidecar  *SidecarNode
 }
 
 // IsStandard 报告是否为 http/https/socks 系标准代理 URL
 // (此时拨号由调用方原有逻辑处理,本包未生成拨号函数)
 func (out *Outbound) IsStandard() bool { return out.standard }
 
+// NeedsSidecar 报告是否需要 sing-box 转换层承载
+func (out *Outbound) NeedsSidecar() bool { return out != nil && out.sidecar != nil }
+
+// Sidecar 返回 sing-box 转换层节点描述(NeedsSidecar 为 true 时有效)
+func (out *Outbound) Sidecar() *SidecarNode { return out.sidecar }
+
 // Raw 返回去除首尾空白后的原始代理字符串
 func (out *Outbound) Raw() string { return out.raw }
 
 // DialContext 建立经代理服务器到目标地址的连接
 func (out *Outbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if out == nil || out.dial == nil {
+	if out == nil {
+		return nil, fmt.Errorf("代理出站未初始化")
+	}
+	if out.dial == nil {
+		if out.sidecar != nil {
+			return nil, fmt.Errorf("%s 节点需要 sing-box 转换层: 请经 internal/sidecar.Ensure 获取本地 socks5 地址后再拨号", out.sidecar.Type)
+		}
 		return nil, fmt.Errorf("代理出站未初始化")
 	}
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
@@ -70,7 +92,8 @@ func (out *Outbound) DialContext(ctx context.Context, network, address string) (
 }
 
 // Parse 解析代理 URL。http/https/socks 系返回 IsStandard 的透传结果;
-// vless/trojan/ss 解析节点参数并构造拨号函数;其余 scheme 报错。
+// vless/trojan/ss 依参数决定进程内拨号或 SidecarNode;vmess/hysteria2/
+// hysteria/tuic/anytls 解析为 SidecarNode;其余 scheme 报错。
 //
 // Parse 只做语法与支持范围校验,不发起任何网络请求,可安全用于
 // 启动期配置校验(ValidateProxy)。
@@ -88,24 +111,33 @@ func Parse(raw string) (*Outbound, error) {
 		return &Outbound{raw: raw, scheme: scheme, standard: true}, nil
 	}
 	var dial func(context.Context, string, string) (net.Conn, error)
+	var sidecar *SidecarNode
 	switch scheme {
 	case "vless":
-		dial, err = parseVLESS(raw, parsed)
+		dial, sidecar, err = parseVLESS(raw, parsed)
 	case "trojan":
-		dial, err = parseTrojan(raw, parsed)
+		dial, sidecar, err = parseTrojan(raw, parsed)
 	case "ss":
-		dial, err = parseShadowsocks(raw, parsed)
+		dial, sidecar, err = parseShadowsocks(raw, parsed)
 	case "vmess":
-		return nil, fmt.Errorf("vmess:// 暂不支持: 请将节点换为 VLESS/Trojan/SS,或本机运行 sing-box 把 vmess 转成 socks5 后填写 socks5://127.0.0.1:端口")
-	case "hysteria2", "hysteria", "tuic", "wireguard", "juicity":
-		return nil, fmt.Errorf("%s:// 协议暂不支持: 请本机运行 sing-box/xray 转成 socks5 后填写 socks5://127.0.0.1:端口", scheme)
+		sidecar, err = parseVMess(raw)
+	case "hysteria2", "hy2":
+		sidecar, err = parseHysteria2(raw, parsed)
+	case "hysteria":
+		sidecar, err = parseHysteria1(raw, parsed)
+	case "tuic":
+		sidecar, err = parseTUIC(raw, parsed)
+	case "anytls":
+		sidecar, err = parseAnyTLS(raw, parsed)
+	case "wireguard", "juicity", "ssr", "snell", "brook", "naive", "mieru", "ssh", "tor":
+		return nil, fmt.Errorf("%s:// 分享链接不受支持: 可将节点换为 vless/vmess/trojan/ss/hysteria2/tuic/anytls,或自建 WireGuard 后用 socks5:// 指向本机转换层", scheme)
 	default:
-		return nil, fmt.Errorf("代理协议 %s 不受支持(可用: http/https/socks5/socks4/vless/trojan/ss)", scheme)
+		return nil, fmt.Errorf("代理协议 %s 不受支持(可用: http/https/socks5/socks4/vless/vmess/trojan/ss/hysteria2/tuic/anytls)", scheme)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &Outbound{raw: raw, scheme: scheme, dial: dial}, nil
+	return &Outbound{raw: raw, scheme: scheme, dial: dial, sidecar: sidecar}, nil
 }
 
 // Validate 校验代理 URL 语法与支持范围(不发起网络请求)
@@ -114,27 +146,79 @@ func Validate(raw string) error {
 	return err
 }
 
+// SchemeHint 返回脱敏后的代理地址(scheme://host:port),
+// 供日志使用,避免打印链接中的凭证(UUID/密码)。
+func SchemeHint(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if index := strings.Index(trimmed, "://"); index > 0 {
+		rest := trimmed[index+3:]
+		// 剥离 userinfo 与查询参数
+		if at := strings.LastIndex(rest, "@"); at >= 0 {
+			rest = rest[at+1:]
+		}
+		if question := strings.IndexAny(rest, "?#"); question >= 0 {
+			rest = rest[:question]
+		}
+		return trimmed[:index] + "://" + rest
+	}
+	return "<proxy>"
+}
+
 // linkTransport 描述分享链接里的传输层与安全层参数(三协议共用)
 type linkTransport struct {
-	host       string // 代理服务器地址
-	port       int    // 代理服务器端口
-	network    string // "tcp" 或 "ws"
-	path       string // WS path
-	hostHeader string // WS Host 头(伪装域名)
-	tlsEnabled bool
-	sni        string
-	insecure   bool
+	host        string // 代理服务器地址
+	port        int    // 代理服务器端口
+	network     string // tcp / ws / grpc / httpupgrade / h2 / quic
+	path        string // WS path / grpc serviceName / h2 path
+	hostHeader  string // WS Host 头(伪装域名)
+	tlsEnabled  bool
+	security    string // "" / none / tls / reality(仅 vless)
+	realityKey  string // reality public_key(pbk)
+	realitySID  string // reality short_id(sid)
+	fingerprint string // utls 指纹(fp)
+	alpn        []string
+	sni         string
+	insecure    bool
+}
+
+// normalizeTransport 把分享链接里的传输层名称归一化到标准名
+func normalizeTransport(name string) (string, error) {
+	switch name {
+	case "", "tcp", "raw", "none":
+		return "tcp", nil
+	case "ws", "websocket":
+		return "ws", nil
+	case "grpc":
+		return "grpc", nil
+	case "httpupgrade":
+		return "httpupgrade", nil
+	case "h2", "http":
+		return "h2", nil
+	case "quic":
+		return "quic", nil
+	case "kcp", "mkcp":
+		return "", fmt.Errorf("传输层 kcp(mkcp)不受支持: sing-box/xray-kcp 节点请改用 tcp/ws/grpc 传输")
+	case "splithttp", "xhttp":
+		return "", fmt.Errorf("传输层 splithttp(xhttp)不受支持: 该传输仅 xray 内核支持,请把节点换成 tcp/ws/grpc/httpupgrade 传输")
+	default:
+		return "", fmt.Errorf("传输层 %s 无法识别", name)
+	}
 }
 
 // parseLinkTransport 从 URL query 提取传输层参数:
-//   - type / network: tcp(默认) / ws;其余报错
-//   - security: none / tls(默认 trojan;vless 默认 none);reality 报错
+//   - type / network: tcp(默认)/ ws / grpc / httpupgrade / h2 / quic
+//     (native 拨号仅支持 tcp/ws,其余由调用方转 SidecarNode)
+//   - security: none / tls(默认 trojan;vless 默认 none);reality 记录待 vless 侧处理
 //   - sni / peer: TLS ServerName,缺省用服务器地址
 //   - host: WS Host 头,缺省用服务器地址
 //   - path / serviceName: WS path,缺省 "/"
+//   - fp: utls 指纹;alpn: 逗号分隔列表
 //   - allowInsecure / insecure: 跳过证书校验(仅测试环境)
 func parseLinkTransport(parsed *url.URL, defaultTLS bool) (linkTransport, error) {
-	transport := linkTransport{tlsEnabled: defaultTLS}
+	transport := linkTransport{tlsEnabled: defaultTLS, network: "tcp"}
 	if parsed.Hostname() == "" {
 		return transport, fmt.Errorf("代理链接缺少服务器地址")
 	}
@@ -146,17 +230,11 @@ func parseLinkTransport(parsed *url.URL, defaultTLS bool) (linkTransport, error)
 	transport.port = port
 
 	query := parsed.Query()
-	network := lowerQuery(query, "type", "network")
-	switch network {
-	case "", "tcp", "raw", "none":
-		transport.network = "tcp"
-	case "ws", "websocket":
-		transport.network = "ws"
-	case "grpc", "httpupgrade", "h2", "http", "kcp", "quic":
-		return transport, fmt.Errorf("传输层 %s 暂不支持(仅支持 tcp/ws): 可在节点服务端开启 ws 传输后重试", network)
-	default:
-		return transport, fmt.Errorf("传输层 %s 无法识别", network)
+	network, err := normalizeTransport(lowerQuery(query, "type", "network"))
+	if err != nil {
+		return transport, err
 	}
+	transport.network = network
 
 	security := lowerQuery(query, "security")
 	switch security {
@@ -167,9 +245,17 @@ func parseLinkTransport(parsed *url.URL, defaultTLS bool) (linkTransport, error)
 	case "none":
 		transport.tlsEnabled = false
 	case "reality":
-		return transport, fmt.Errorf("VLESS REALITY 暂不支持: 请在节点服务端将 security 改为 tls 后重试")
+		transport.security = "reality"
+		transport.tlsEnabled = true
 	default:
-		return transport, fmt.Errorf("安全层 %s 无法识别(仅支持 none/tls)", security)
+		return transport, fmt.Errorf("安全层 %s 无法识别(仅支持 none/tls/reality)", security)
+	}
+	if transport.security == "" {
+		if transport.tlsEnabled {
+			transport.security = "tls"
+		} else {
+			transport.security = "none"
+		}
 	}
 
 	transport.sni = firstQuery(query, "sni", "peer", "host")
@@ -178,11 +264,42 @@ func parseLinkTransport(parsed *url.URL, defaultTLS bool) (linkTransport, error)
 	if transport.path == "" {
 		transport.path = "/"
 	}
+	transport.fingerprint = normalizeFingerprint(firstQuery(query, "fp", "fingerprint"))
+	if alpn := firstQuery(query, "alpn"); alpn != "" {
+		for _, item := range strings.Split(alpn, ",") {
+			if item = strings.TrimSpace(item); item != "" {
+				transport.alpn = append(transport.alpn, item)
+			}
+		}
+	}
 	insecure := lowerQuery(query, "allowInsecure", "insecure", "allow_insecure")
 	if insecure == "1" || insecure == "true" {
 		transport.insecure = true
 	}
 	return transport, nil
+}
+
+// utlsFingerprints 是 sing-box utls 接受的指纹列表
+var utlsFingerprints = map[string]struct{}{
+	"chrome": {}, "firefox": {}, "edge": {}, "safari": {}, "ios": {},
+	"android": {}, "chrome_psk": {}, "chrome_padding_psk": {},
+	"randomized": {}, "randomizedalpn": {}, "qq": {}, "wechat": {}}
+
+// normalizeFingerprint 归一并校验 utls 指纹名(空返回空)
+func normalizeFingerprint(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "random" {
+		return "randomized"
+	}
+	return value
+}
+
+func fingerprintAllowed(value string) bool {
+	if value == "" {
+		return true
+	}
+	_, ok := utlsFingerprints[value]
+	return ok
 }
 
 // dialTransport 建立到代理服务器的底层连接(TCP/TLS/WS 由参数决定)

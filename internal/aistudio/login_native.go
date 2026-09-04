@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/proxyproto"
+	"github.com/Mag1cFall/AIStudio2API/internal/sidecar"
 )
 
 // NativeLoginDriver 通过纯 Go WebDriver BiDi 完成隔离登录
@@ -104,8 +106,9 @@ func (driver *NativeLoginDriver) options(ctx context.Context, request IsolatedLo
 }
 
 // browserLoginProxy 把登录代理转换为 Camoufox 可用形式:
-// vless/trojan/ss 分享链接在登录会话内架设 SOCKS5 桥(会话结束自动关闭),
-// 其余(http/https/socks5/空)原样返回。
+// vless/trojan/ss 简单组合在登录会话内架设 SOCKS5 桥(会话结束自动关闭);
+// vmess/REALITY/hysteria2/tuic 等进阶协议走 sing-box 转换层(进程级共享,
+// 不随会话结束关闭);其余(http/https/socks5/空)原样返回。
 func browserLoginProxy(ctx context.Context, proxyURL string) string {
 	proxyURL = strings.TrimSpace(proxyURL)
 	if proxyURL == "" {
@@ -114,6 +117,15 @@ func browserLoginProxy(ctx context.Context, proxyURL string) string {
 	outbound, err := proxyproto.Parse(proxyURL)
 	if err != nil || outbound.IsStandard() {
 		return proxyURL
+	}
+	if outbound.NeedsSidecar() {
+		socksAddress, sidecarErr := sidecar.Ensure(proxyURL)
+		if sidecarErr != nil {
+			slog.Warn("sing-box 转换层启动失败,登录代理回退原值",
+				"proxy", proxyproto.SchemeHint(proxyURL), "error", sidecarErr)
+			return proxyURL
+		}
+		return socksAddress
 	}
 	bridged, err := proxyproto.ServeSOCKS5(ctx, outbound)
 	if err != nil {

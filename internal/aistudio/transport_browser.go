@@ -21,6 +21,7 @@ import (
 	"golang.org/x/net/proxy"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/proxyproto"
+	"github.com/Mag1cFall/AIStudio2API/internal/sidecar"
 )
 
 const browserProxyConnectTimeout = 30 * time.Second
@@ -79,8 +80,9 @@ type browserResponseBody struct {
 
 // newBrowserRoundTripper 创建与当前 Camoufox 网络形状一致的传输。
 //
-// 代理支持:http/https/socks5,以及 vless:// / trojan:// / ss:// 分享链接
-// (后三者由 proxyproto 包直接拨号,详见其包注释中的支持范围)
+// 代理支持:http/https/socks5;vless/trojan/ss 分享链接(由 proxyproto
+// 包进程内拨号);vmess/hysteria2/hysteria/tuic/anytls 及 vless REALITY/
+// vision/进阶传输(sing-box 转换层,由 internal/sidecar 拉起子进程)
 func newBrowserRoundTripper(proxyURL string) (stdhttp.RoundTripper, error) {
 	proxyURL = strings.TrimSpace(proxyURL)
 	var proxyDialer proxy.ContextDialer
@@ -91,14 +93,29 @@ func newBrowserRoundTripper(proxyURL string) (stdhttp.RoundTripper, error) {
 		}
 		switch strings.ToLower(parsed.Scheme) {
 		case "http", "https", "socks5":
-		case "vless", "trojan", "ss":
+		case "vless", "vmess", "trojan", "ss", "hysteria", "hysteria2", "hy2", "tuic", "anytls":
 			outbound, parseErr := proxyproto.Parse(proxyURL)
 			if parseErr != nil {
 				return nil, parseErr
 			}
-			proxyDialer = outboundContextDialer{outbound: outbound}
+			if outbound.NeedsSidecar() {
+				socksAddress, sidecarErr := sidecar.Ensure(proxyURL)
+				if sidecarErr != nil {
+					return nil, sidecarErr
+				}
+				socksURL, parseErr := url.Parse(socksAddress)
+				if parseErr != nil {
+					return nil, fmt.Errorf("sing-box 转换层地址无效: %w", parseErr)
+				}
+				proxyDialer, err = newBrowserProxyDialer(socksURL)
+				if err != nil {
+					return nil, fmt.Errorf("接入 sing-box 转换层失败: %w", err)
+				}
+			} else {
+				proxyDialer = outboundContextDialer{outbound: outbound}
+			}
 		default:
-			return nil, fmt.Errorf("代理协议必须是 http、https、socks5、vless、trojan 或 ss")
+			return nil, fmt.Errorf("代理协议必须是 http、https、socks5 或 vless/vmess/trojan/ss/hysteria2/hysteria/tuic/anytls 分享链接")
 		}
 		if proxyDialer == nil {
 			proxyDialer, err = newBrowserProxyDialer(parsed)

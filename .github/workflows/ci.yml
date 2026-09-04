@@ -68,6 +68,29 @@ jobs:
       - name: Go test
         run: go test ./... -count=1
 
+      # 代理协议全链路验证:拉取与 internal/sidecar/binary.go 常量同版本的
+      # sing-box,跑 10 种协议(vless REALITY/vision/grpc/httpupgrade/ws-ed、
+      # vmess、trojan、SS2022、hysteria2、tuic)的真实子进程端到端测试;
+      # 无 sing-box 时这些用例自动 skip(本地开发不强制安装),CI 保底拦
+      # 配置 schema 回归(sing-box 升版后字段变化会在此暴露)
+      - name: Proxy protocol e2e tests (sing-box)
+        run: |
+          set -o pipefail
+          SINGBOX_VERSION=$(grep -oE 'singboxVersion = "[^"]+"' internal/sidecar/binary.go | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          SINGBOX_SHA=$(grep -oE '"linux-amd64": "[0-9a-f]{64}"' internal/sidecar/binary.go | grep -oE '[0-9a-f]{64}')
+          test -n "$SINGBOX_VERSION" && test -n "$SINGBOX_SHA"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --silent --show-error \
+            -o /tmp/singbox.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          echo "${SINGBOX_SHA}  /tmp/singbox.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/singbox.tar.gz -C /tmp
+          export SINGBOX_PATH=/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box
+          go test ./internal/sidecar/ -count=1 -v 2>&1 | tee /tmp/sidecar-test.log
+          # 确认端到端用例真实执行而非被 skip
+          if grep -q "SKIP: TestSidecarEndToEnd" /tmp/sidecar-test.log; then
+            echo "ERROR: 端到端用例被跳过,sing-box 下载或发现失败" >&2; exit 1
+          fi
+
       - name: Frontend install
         working-directory: web
         run: npm ci
@@ -83,4 +106,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- go vet: done" >> $GITHUB_STEP_SUMMARY
           echo "- go build: done" >> $GITHUB_STEP_SUMMARY
+          echo "- go test: done" >> $GITHUB_STEP_SUMMARY
+          echo "- proxy protocol e2e (sing-box): done" >> $GITHUB_STEP_SUMMARY
           echo "- vue-tsc typecheck: done" >> $GITHUB_STEP_SUMMARY

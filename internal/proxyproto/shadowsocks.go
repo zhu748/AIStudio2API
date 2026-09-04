@@ -42,31 +42,71 @@ var shadowsocksAEADMethods = map[string]struct{ keyLen, saltLen int }{
 //  2. 旧式整体编码: ss://BASE64URL(method:password@host:port)#tag
 //  3. SIP002 明文: ss://method:password@host:port#tag
 //
-// 仅支持 AEAD method(aes-*-gcm / *chacha20-ietf-poly1305);
-// SS2022(blake3 系)与 SIP003 plugin 报错并给出建议。
-func parseShadowsocks(raw string, parsed *url.URL) (func(context.Context, string, string) (net.Conn, error), error) {
+// 处理分级:
+//   - AEAD method 无 plugin → 进程内原生拨号
+//   - SS2022(2022-blake3 系)与 SIP003 plugin(obfs/v2ray-plugin)
+//     → sing-box 转换层承载
+//   - 旧版流式 method(rc4-md5、aes-*-cfb 等)已被各内核移除,直接报错
+func parseShadowsocks(raw string, parsed *url.URL) (func(context.Context, string, string) (net.Conn, error), *SidecarNode, error) {
 	method, password, host, port, err := decodeShadowsocksLink(parsed, raw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	method = strings.ToLower(strings.TrimSpace(method))
+	query := parsed.Query()
+	pluginParam := firstQuery(query, "plugin")
+	if isSS2022Method(method) || pluginParam != "" {
+		if !isSS2022Method(method) {
+			if _, ok := shadowsocksAEADMethods[method]; !ok {
+				return nil, nil, fmt.Errorf("SS method %q 不受支持(仅支持 AEAD 与 2022-blake3 系)", method)
+			}
+		} else if err := validateSS2022Key(method, password); err != nil {
+			return nil, nil, err
+		}
+		plugin, pluginOpts := splitSIP003Plugin(pluginParam)
+		node, sidecarErr := buildShadowsocksSidecar(method, password, host, port, plugin, pluginOpts, linkTag(parsed))
+		if sidecarErr != nil {
+			return nil, nil, fmt.Errorf("ss 链接无效: %w", sidecarErr)
+		}
+		return nil, node, nil
+	}
 	spec, ok := shadowsocksAEADMethods[method]
 	if !ok {
-		if strings.Contains(method, "2022") || strings.Contains(method, "blake3") {
-			return nil, fmt.Errorf("SS2022 method %q 暂不支持: 请在节点服务端改用 aes-256-gcm 或 chacha20-ietf-poly1305", method)
-		}
-		return nil, fmt.Errorf("SS method %q 不受支持(仅支持 AEAD: aes-128-gcm/aes-256-gcm/chacha20-ietf-poly1305)", method)
-	}
-	query := parsed.Query()
-	if plugin := firstQuery(query, "plugin"); plugin != "" {
-		return nil, fmt.Errorf("SIP003 plugin(%s)暂不支持: 请在节点服务端去掉 plugin 后重试", plugin)
+		return nil, nil, fmt.Errorf("SS method %q 不受支持(仅支持 AEAD: aes-128-gcm/aes-256-gcm/chacha20-ietf-poly1305,或 2022-blake3 系)", method)
 	}
 	node := &shadowsocksOutbound{
 		host: host, port: port, method: method,
 		key:     evpBytesToKey(password, spec.keyLen),
 		saltLen: spec.saltLen,
 	}
-	return node.dial, nil
+	return node.dial, nil, nil
+}
+
+// isSS2022Method 判断是否为 SS2022(2022-blake3)系 method
+func isSS2022Method(method string) bool {
+	return strings.HasPrefix(method, "2022-blake3-")
+}
+
+// validateSS2022Key 校验 SS2022 密钥:password 本身是 base64 密钥,
+// 长度必须与 method 匹配(16/32 字节)
+func validateSS2022Key(method, password string) error {
+	required := 0
+	switch method {
+	case "2022-blake3-aes-128-gcm":
+		required = 16
+	case "2022-blake3-aes-256-gcm":
+		required = 32
+	default:
+		return fmt.Errorf("SS2022 method %q 不受支持(可用: 2022-blake3-aes-128-gcm/2022-blake3-aes-256-gcm)", method)
+	}
+	if strings.Contains(password, ":") {
+		return fmt.Errorf("SS2022 多用户密钥列表不受支持: password 应为单个 base64 密钥")
+	}
+	decoded, err := decodeBase64Bytes(password)
+	if err != nil || len(decoded) != required {
+		return fmt.Errorf("SS2022 密钥应为 %d 字节的 base64 编码", required)
+	}
+	return nil
 }
 
 // decodeShadowsocksLink 从三种链接形态中提取 method/password/host/port。

@@ -49,18 +49,45 @@ func TestParseStandardProxyPassthrough(t *testing.T) {
 
 func TestParseRejectsUnsupported(t *testing.T) {
 	cases := []string{
-		"vmess://eyJ2IjoiMiIsInBzIjoidGVzdCJ9",                                 // vmess
-		"vless://uuid@example.com:443?security=reality",                        // REALITY
-		"vless://uuid@example.com:443?flow=xtls-rprx-vision",                   // flow
-		"vless://uuid@example.com:443?encryption=aes-128-gcm",                  // encryption != none
-		"vless://uuid@example.com:443?type=grpc",                               // grpc 传输
-		"ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@example.com:8388?plugin=obfs-local", // SIP003 plugin
-		"hysteria2://password@example.com:443",                                 // QUIC 系
-		"ss2022://xxx@example.com:8388",                                        // 未知 scheme
+		"vmess://eyJ2IjoiMiIsInBzIjoidGVzdCJ9",                        // JSON 缺少服务器地址
+		"vless://uuid@example.com:443?security=reality",               // REALITY 缺少 pbk
+		"vless://uuid@example.com:443?encryption=aes-128-gcm",         // encryption != none
+		"vless://uuid@example.com:443?type=kcp",                       // kcp 传输
+		"vless://uuid@example.com:443?type=splithttp",                 // xhttp 传输
+		"ss://unknown-cipher:pass@example.com:8388?plugin=obfs-local", // 非法 method + plugin
+		"ssr://xxx@example.com:8388",                                  // 长尾协议
+		"wireguard://xxx@example.com:51820",                           // 长尾协议
+		"ss2022://xxx@example.com:8388",                               // 未知 scheme
 	}
 	for _, raw := range cases {
 		if err := Validate(raw); err == nil {
 			t.Fatalf("Validate(%q) 应报错", raw)
+		}
+	}
+}
+
+// TestParseRoutesToSidecar 验证进阶协议链接解析为 SidecarNode 而非报错
+func TestParseRoutesToSidecar(t *testing.T) {
+	sidecarLinks := []string{
+		"vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=reality&pbk=uQbpmanuRsX87EjqDfzQTaEx0T_gY7ToLAjy6ZTXoQU&sid=0123",
+		"vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?flow=xtls-rprx-vision",
+		"vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=grpc&serviceName=svc",
+		"vmess://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption=auto",
+		"hysteria2://password@example.com:443",
+		"tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@example.com:443",
+		"anytls://pw@example.com:443",
+		"ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@example.com:8388?plugin=obfs-local",
+	}
+	for _, raw := range sidecarLinks {
+		outbound, err := Parse(raw)
+		if err != nil {
+			t.Fatalf("Parse(%q) 应走 sing-box 转换层: %v", raw, err)
+		}
+		if !outbound.NeedsSidecar() {
+			t.Fatalf("Parse(%q) 应解析为 SidecarNode", raw)
+		}
+		if outbound.Sidecar() == nil || outbound.Sidecar().Type == "" {
+			t.Fatalf("Parse(%q) 的 SidecarNode 不完整", raw)
 		}
 	}
 }

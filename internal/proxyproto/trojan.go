@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 )
 
 // trojanOutbound 描述一个 Trojan 节点
@@ -18,21 +19,30 @@ type trojanOutbound struct {
 // parseTrojan 解析 trojan://password@host:port?...#tag 形式的分享链接
 //
 // 受支持的参数:
-//   - type: tcp(默认)/ ws
+//   - type: tcp(默认)/ ws → 进程内原生拨号;
+//     grpc / httpupgrade / h2 / quic → sing-box 转换层
 //   - security: tls(默认,符合 trojan-gfw 约定)/ none
-//   - sni / host / path / allowInsecure: 同 linkTransport
-func parseTrojan(raw string, parsed *url.URL) (func(context.Context, string, string) (net.Conn, error), error) {
+//   - sni / host / path / allowInsecure / fp / alpn: 透传两层
+func parseTrojan(raw string, parsed *url.URL) (func(context.Context, string, string) (net.Conn, error), *SidecarNode, error) {
 	if parsed.User == nil {
-		return nil, fmt.Errorf("trojan 链接缺少密码(应形如 trojan://password@host:port)")
+		return nil, nil, fmt.Errorf("trojan 链接缺少密码(应形如 trojan://password@host:port)")
 	}
 	password := parsed.User.Username()
-	node := &trojanOutbound{password: password}
 	transport, err := parseLinkTransport(parsed, true)
 	if err != nil {
-		return nil, fmt.Errorf("trojan 链接无效: %w", err)
+		return nil, nil, fmt.Errorf("trojan 链接无效: %w", err)
 	}
+	// ws 0-RTT(path 携带 ?ed=)与 grpc/httpupgrade/h2 等传输转转换层
+	if transport.network != "tcp" && transport.network != "ws" || strings.Contains(transport.path, "?ed=") {
+		node, sidecarErr := buildTrojanSidecar(password, transport, linkTag(parsed))
+		if sidecarErr != nil {
+			return nil, nil, fmt.Errorf("trojan 链接无效: %w", sidecarErr)
+		}
+		return nil, node, nil
+	}
+	node := &trojanOutbound{password: password}
 	node.transport = transport
-	return node.dial, nil
+	return node.dial, nil, nil
 }
 
 // dial 建立经 Trojan 节点到目标地址的 TCP 连接

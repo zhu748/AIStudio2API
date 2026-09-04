@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
 	"github.com/Mag1cFall/AIStudio2API/internal/proxyproto"
+	"github.com/Mag1cFall/AIStudio2API/internal/sidecar"
 )
 
 // newRuntime 装配单个生成服务实例
@@ -469,9 +471,10 @@ func (manager *accountWorkerManager) workerConfig(account *aistudio.Account) cam
 }
 
 // browserProxy 把代理 URL 转换为浏览器可用的形式:
-// vless/trojan/ss 分享链接在进程内架设 SOCKS5 桥后返回桥地址,
+// vless/trojan/ss 简单组合在进程内架设 SOCKS5 桥后返回桥地址;
+// vmess/REALITY/hysteria2/tuic 等进阶协议返回 sing-box 转换层的
+// 本地 SOCKS5 地址(进程级共享,由 sidecar 包自行按链接去重);
 // 其余(http/https/socks5/空)原样返回。
-// 桥按分享链接 URL 复用,生命周期绑定 manager(停机时监听器自动关闭)。
 func (manager *accountWorkerManager) browserProxy(proxyURL string) string {
 	proxyURL = strings.TrimSpace(proxyURL)
 	if proxyURL == "" {
@@ -480,6 +483,16 @@ func (manager *accountWorkerManager) browserProxy(proxyURL string) string {
 	outbound, err := proxyproto.Parse(proxyURL)
 	if err != nil || outbound.IsStandard() {
 		return proxyURL
+	}
+	if outbound.NeedsSidecar() {
+		socksAddress, sidecarErr := sidecar.Ensure(proxyURL)
+		if sidecarErr != nil {
+			// 转换层失败时回退原 URL,由 Camoufox 报出明确错误
+			slog.Error("sing-box 转换层启动失败,代理回退原值",
+				"proxy", proxyproto.SchemeHint(proxyURL), "error", sidecarErr)
+			return proxyURL
+		}
+		return socksAddress
 	}
 	manager.proxyBridgesMu.Lock()
 	defer manager.proxyBridgesMu.Unlock()

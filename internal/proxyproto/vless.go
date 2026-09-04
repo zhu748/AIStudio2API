@@ -20,35 +20,51 @@ type vlessOutbound struct {
 //
 // 受支持的参数:
 //   - encryption: 必须为 none(VLESS 本体不加密)
-//   - type: tcp(默认)/ ws
-//   - security: none(默认)/ tls
-//   - sni / host / path / allowInsecure: 同 linkTransport
+//   - type: tcp(默认)/ ws → 进程内原生拨号;
+//     grpc / httpupgrade / h2 / quic → sing-box 转换层
+//   - security: none(默认)/ tls → 原生;reality → 转换层
+//   - flow: 空 → 原生;xtls-rprx-vision → 转换层
+//   - sni / host / path / allowInsecure / fp / alpn: 透传两层
 //
-// 不支持并报错:
-//   - security=reality(REALITY)
-//   - flow 非空且非 none(xtls-rprx-vision 等需要 XTLS 流切换)
-func parseVLESS(raw string, parsed *url.URL) (func(context.Context, string, string) (net.Conn, error), error) {
+// 返回值: dial 与 sidecar 二选一(均为 nil 视为参数非法)。
+func parseVLESS(raw string, parsed *url.URL) (func(context.Context, string, string) (net.Conn, error), *SidecarNode, error) {
 	if parsed.User == nil || strings.TrimSpace(parsed.User.Username()) == "" {
-		return nil, fmt.Errorf("vless 链接缺少 UUID(应形如 vless://uuid@host:port)")
+		return nil, nil, fmt.Errorf("vless 链接缺少 UUID(应形如 vless://uuid@host:port)")
 	}
 	uuidText := strings.TrimSpace(parsed.User.Username())
 	uuidBytes, err := parseUUID(uuidText)
 	if err != nil {
-		return nil, fmt.Errorf("vless UUID 无效: %w", err)
+		return nil, nil, fmt.Errorf("vless UUID 无效: %w", err)
 	}
 	query := parsed.Query()
 	if encryption := lowerQuery(query, "encryption"); encryption != "" && encryption != "none" {
-		return nil, fmt.Errorf("vless encryption 仅支持 none,收到 %q", encryption)
+		return nil, nil, fmt.Errorf("vless encryption 仅支持 none,收到 %q", encryption)
 	}
-	if flow := lowerQuery(query, "flow"); flow != "" && flow != "none" {
-		return nil, fmt.Errorf("vless flow %q 暂不支持(xtls-rprx-vision 系列需 XTLS 流切换): 请在节点服务端去掉 flow 后重试", flow)
-	}
+	flow := lowerQuery(query, "flow")
 	transport, err := parseLinkTransport(parsed, false)
 	if err != nil {
-		return nil, fmt.Errorf("vless 链接无效: %w", err)
+		return nil, nil, fmt.Errorf("vless 链接无效: %w", err)
 	}
-	node := &vlessOutbound{transport: transport, uuid: uuidBytes}
-	return node.dial, nil
+	// REALITY 参数在 parseLinkTransport 层已识别 security,凭证在此提取
+	if transport.security == "reality" {
+		transport.realityKey = firstQuery(query, "pbk", "publicKey", "public_key")
+		transport.realitySID = firstQuery(query, "sid", "shortId", "short_id")
+	}
+	native := transport.network == "tcp" || transport.network == "ws"
+	native = native && transport.security != "reality"
+	native = native && (flow == "" || flow == "none")
+	// ws 0-RTT(path 携带 ?ed=)仅 sing-box 支持 max_early_data,原生
+	// 拨号会把整个 path 当握手路径导致服务端 404,必须转转换层
+	native = native && !strings.Contains(transport.path, "?ed=")
+	if !native {
+		node, sidecarErr := buildVLESSSidecar(uuidText, transport, flow, linkTag(parsed))
+		if sidecarErr != nil {
+			return nil, nil, fmt.Errorf("vless 链接无效: %w", sidecarErr)
+		}
+		return nil, node, nil
+	}
+	vless := &vlessOutbound{transport: transport, uuid: uuidBytes}
+	return vless.dial, nil, nil
 }
 
 // dial 建立经 VLESS 节点到目标地址的 TCP 连接

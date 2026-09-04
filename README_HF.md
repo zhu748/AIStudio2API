@@ -187,40 +187,61 @@ gzip 实测压缩率：1.5KB → 412B（约 73% 压缩）。多账号场景几�
 
 ---
 
-## 三-B、代理直接填分享链接(vless / trojan / ss)
+## 三-B、代理直填分享链接(全协议)
 
-`PROXY` 环境变量与账号级 `proxy` 字段除了 http/https/socks5,现在可以直接粘贴
-机场或自建节点导出的分享链接,**无需再在宿主机跑 sing-box/xray 转换层**:
+`PROXY` 环境变量与账号级 `proxy` 字段除了 http/https/socks5,可以直接粘贴
+机场或自建节点导出的分享链接。全部主流协议分两级承载:
 
 ```
 PROXY=vless://b831381d-xxxx@1.2.3.4:443?security=tls&sni=cdn.example.com&type=ws&host=cdn.example.com&path=%2Fws
+PROXY=vmess://eyJ2IjoiMiIsInBzIjoi5p2t5paHIiwibmV0Ijoid3MiLCJwYXRoIjoiL3BhdGgifQ==
 PROXY=trojan://password@1.2.3.4:443?sni=example.com
+PROXY=hy2://password@1.2.3.4:443?sni=example.com&obfs=salamander&obfs-password=xx
+PROXY=tuic://uuid:password@1.2.3.4:443?congestion_control=bbr&alpn=h3
 PROXY=ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388
 ```
 
-支持范围:
+**第 1 级·进程内原生拨号(零外部依赖,基于标准库 crypto)**
 
 | 协议 | 传输 | 安全层 | 说明 |
 |------|------|--------|------|
-| `vless://` | tcp / ws | none / tls | 机场最主流;uuid 即 userinfo |
+| `vless://` | tcp / ws | none / tls | uuid 即 userinfo;ws 含 0-RTT early data(`?ed=2048`) |
 | `trojan://` | tcp / ws | tls(默认) / none | password 即 userinfo,SHA224 认证 |
-| `ss://` | tcp | 内建 AEAD | aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305;支持 SIP002 与旧式整体 base64 两种链接 |
+| `ss://` | tcp | 内建 AEAD | aes-128/256-gcm、chacha20-ietf-poly1305;SIP002 与旧式整体 base64 链接均可 |
 
-常用参数(三协议通用):`sni`(TLS 域名)、`type=ws&path=/xx&host=xx`(WebSocket 伪装)、
-`allowInsecure=1`(跳过证书校验,仅测试)。
+**第 2 级·sing-box 转换层(Docker 镜像已预置 v1.14.0,自动按需拉起)**
+
+| 协议 | 覆盖范围 | 备注 |
+|------|----------|------|
+| `vless://` REALITY | `security=reality` + `pbk`/`sid`/`fp` 全参 | 未填 fp 默认 chrome |
+| `vless://` flow | `xtls-rprx-vision` | 旧版 direct/origin flow 已被各内核移除,会报错 |
+| `vmess://` | v2rayN base64 JSON 与 URI 参数两种链接形态;全部 cipher(auto/aes-128-gcm/chacha20-poly1305/none/zero) | alterId 保留 |
+| 进阶传输 | grpc / httpupgrade / h2 / quic(vless、vmess、trojan 均可) | `serviceName` 即 path |
+| `ss://` SS2022 | 2022-blake3 系 method | password 原样透传 |
+| `ss://` SIP003 plugin | `plugin=obfs-local;obfs=http;...` / v2ray-plugin 系 | |
+| `hy2://` / `hysteria2://` | salamander 混淆、up/down 限速、mport 端口跳跃 | 端口缺省 443 |
+| `hysteria://` | v1 链接(auth 参数鉴权) | 旧行协议 |
+| `tuic://` | v5(uuid+password) | TUIC v4(token)已被各内核移除,会报错 |
+| `anytls://` | 2024 新协议 | 端口缺省 443 |
+
+常用通用参数:`sni`(TLS 域名)、`type`(tcp/ws/grpc/httpupgrade/h2/quic)、
+`path`/`host`(WS 伪装)、`fp`(utls 指纹)、`alpn`、`allowInsecure=1`(跳过证书
+校验,仅测试用)。
 
 **工作原理**:
-- API 出站流量:拨号器直接实现协议,无额外进程;
-- **Camoufox 浏览器流量**:浏览器引擎只认 http/socks,程序会在进程内自动架设一个
-  仅监听 127.0.0.1 的 SOCKS5 桥,把分享链接转换后喂给浏览器,登录页/WAA 预热同样走节点;
-- 每个不同的分享链接一个桥,按需复用,随服务停止自动关闭。
+- 第 1 级协议 API 出站流量由拨号器直接实现,无额外进程;**Camoufox 浏览器
+  流量**经进程内 127.0.0.1 SOCKS5 桥转换(登录页/WAA 预热同样走节点);
+- 第 2 级协议首次使用时自动拉起 `sing-box run` 子进程(按链接去重复用,
+  崩溃自动重建,随服务退出自动回收),转换为本地 SOCKS5 后同样喂给浏览器
+  与出站请求——用户无需做任何区分,两种链接的体验完全一致;
+- sing-box 二级发现顺序:`SINGBOX_PATH` 环境变量 → `/usr/local/bin/sing-box`
+  (Docker 镜像预置)→ PATH → 用户缓存目录自动下载(sha256 校验,
+  `SINGBOX_DOWNLOAD=0` 可禁)。非 Docker 部署且未预置时会给出明确指引。
 
-**暂不支持**(填入会启动报错并给出替代建议):
-- `vmess://`——协议陈旧且客户端实现风险高,请把节点换成 VLESS/Trojan/SS,
-  或本机跑 sing-box 转 socks5 后填 `socks5://127.0.0.1:端口`;
-- VLESS `REALITY`(`security=reality`)与 `flow`(xtls-rprx-vision 系)——请在
-  节点服务端改为普通 TLS;
-- `hysteria2/tuic` 等 QUIC 系协议、SS2022(blake3 系 method)、SIP003 plugin(obfs 等)。
+**明确不支持**(填入启动报错并给出替代建议):
+- `ssr://`、`juicity://`、`snell://`、`brook://`、`wireguard://` 等长尾协议
+  ——可自建对应客户端转 socks5 后填 `socks5://127.0.0.1:端口`;
+- kcp(mkcp)与 splithttp(xhttp)传输——仅 xray 内核支持,请换 tcp/ws/grpc。
 
 多账号场景推荐:每个账号凭证配不同节点的 proxy(见第三章包装对象 `proxy` 字段),
 出口 IP 差异化能显著降低 Google 风控。
@@ -446,19 +467,25 @@ curl https://<你的用户名>-aistudio2api.hf.space/v1/chat/completions \
 
 HF Spaces 是共享 IP，Google 容易识别为自动化流量。建议：
 1. 在 Variables 中配置 `PROXY`——住宅代理(http/socks5)或机场节点
-   (vless/trojan/ss 分享链接,见三-B 节)
+   (全协议分享链接,见三-B 节)
 2. 开启 `AISTUDIO_FAILOVER=true` 自动切换备用账号
 3. 或迁到 VPS 部署（参考主 README）
 
-### Q4b: 填了 vless:// 链接后启动报错
+### Q4b: 填了分享链接后启动报错
 
 错误信息会写明原因与替代方案,常见:
-- `vmess:// 暂不支持` → 节点换 VLESS/Trojan,或本机 sing-box 转 socks5
-- `VLESS REALITY 暂不支持` → 服务端 security 改 tls
-- `flow 暂不支持` → 服务端去掉 flow(xtls-rprx-vision)
-- `SS2022 ... 暂不支持` → 服务端 method 改 aes-256-gcm/chacha20-ietf-poly1305
-- `传输层 grpc 暂不支持` → 服务端 type 改 ws 或 tcp
-- 桥相关的连接失败 → 检查节点本身可用性(先用 sing-box/客户端手动连一次)
+- `ssr/juicity/snell/brook/wireguard 分享链接不受支持` → 自建对应客户端
+  转 socks5 后填 `socks5://127.0.0.1:端口`
+- `TUIC v4(token)不受支持` → 服务端升级 v5(现已是主流)
+- `vless flow ... 不受支持` → 服务端去掉旧版 flow(direct/origin 已被
+  各内核移除)
+- `传输层 kcp/splithttp 不受支持` → 节点换 tcp/ws/grpc 传输
+- `vmess 协议不支持 REALITY` / `trojan 不支持 REALITY` → 这两协议服务端
+  本就不该配 reality,检查链接是否拼错
+- `sing-box 转换层启动失败` → Docker 镜像已预置;非 Docker 部署需
+  安装 sing-box 并设 `SINGBOX_PATH`,或设 `SINGBOX_DOWNLOAD=1` 自动下载
+- 转换层/桥相关的连接失败 → 先用 sing-box/其他客户端手动连一次该节点,
+  确认节点本身可用
 
 ### Q5: 如何查看实时日志
 
