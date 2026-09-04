@@ -8,7 +8,7 @@
 
 | 维度 | 设计 |
 |------|------|
-| 凭证注入 | 通过环境变量 `AISTUDIO_AUTH_ACCOUNTS` 注入多账号 JSON，支持 `base64:` / `gzip:` 前缀（gzip 应对 HF 64KB 限制） |
+| 凭证注入 | **推荐**每账号一个编号变量 `AISTUDIO_AUTH_ACCOUNT_1`..`_N`（可直接粘贴 storage-state.json 文件内容），或数组变量 `AISTUDIO_AUTH_ACCOUNTS` 打包全部账号；两种方式互斥，均支持 `base64:` / `gzip:` 前缀 |
 | 多账号 | 启动时把所有账号写入 `/app/auth/<email>/`，AccountStore 自动加载 |
 | 单账号在线 | 默认仅 `AISTUDIO_ACTIVE_EMAIL`（或第一个）账号 `Enabled=true`，其余 `Enabled=false` |
 | 账号切换 | 复用 Web 管理界面"账户"页：停用当前账号 → 启用目标账号，无需重启；或通过 `PUT /api/accounts/{id}` API |
@@ -64,9 +64,52 @@ go build -o aistudio2api ./cmd/aistudio2api
 
 ---
 
-## 三、构造 AISTUDIO_AUTH_ACCOUNTS 环境变量
+## 三、注入账号凭证（环境变量）
 
-### JSON 格式
+支持两种注入方式（**互斥，同时设置启动直接报错**）：
+
+| 方式 | 变量名 | 适用场景 |
+|------|--------|----------|
+| **A（推荐）** | `AISTUDIO_AUTH_ACCOUNT_1`、`AISTUDIO_AUTH_ACCOUNT_2`、`AISTUDIO_AUTH_ACCOUNT_3` … `_10`、`_11`（编号无上限） | 一个变量放一个账号，逐个添加/修改，不用重拼整坨 JSON |
+| B | `AISTUDIO_AUTH_ACCOUNTS`（数组） | 脚本一次性生成全部账号；单变量容量受 HF 64KB 限制 |
+
+### 方式 A：每个账号一个编号环境变量（推荐）
+
+把 `storage-state.json` 文件内容**原样整个粘贴**到一个编号变量即可：
+
+```
+AISTUDIO_AUTH_ACCOUNT_1 = {"cookies":[...],"origins":[],"accountName":"xxx@gmail.com"}
+AISTUDIO_AUTH_ACCOUNT_2 = {"cookies":[...],"origins":[],"accountName":"yyy@gmail.com"}
+AISTUDIO_AUTH_ACCOUNT_10 = {"cookies":[...],"origins":[],"accountName":"zzz@gmail.com"}
+```
+
+规则与行为：
+
+- 编号从 1 开始，**连续或跳号均可**，按数值升序加载（`_10` 排在 `_2` 之后，不受字典序影响）
+- 后缀必须是纯数字；`AISTUDIO_AUTH_ACCOUNT_ONE` 这类拼写错误启动即报错，不会静默丢账号
+- 每个变量值同样支持 `base64:` / `gzip:` 前缀（单个凭证超过 HF Secrets 64KB 时用 gzip）
+- **账户标签自动识别**，优先级：包装对象 `email` > storage-state 的 `aistudio2api` 扩展邮箱 > 根字段 `accountName`（手工导出文件常见，是邮箱格式时直接采用） > 兜底 `account-<编号>@env.local`
+- 默认启用编号最小的账号；`AISTUDIO_ACTIVE_EMAIL` 可指定启用哪个（值填识别出的邮箱）
+
+想自定义标签（例如用 `+123456` 后缀区分凭证）或给账号单独配代理，用**包装对象**格式（字段同方式 B 的账号级字段）：
+
+```json
+{
+  "email": "myname+123456@gmail.com",
+  "storage_state": { "cookies": [...], "origins": [...] },
+  "proxy": "http://user-residential:8080"
+}
+```
+
+单个凭证超过 64KB 时压缩：
+
+```bash
+echo "gzip:$(gzip -c auth-xxx.json | base64 -w0)"
+```
+
+### 方式 B：JSON 数组（单变量打包全部账号）
+
+#### JSON 格式
 
 ```json
 [
@@ -205,7 +248,8 @@ git push space main
 
 | Name | Value | 说明 |
 |------|-------|------|
-| `AISTUDIO_AUTH_ACCOUNTS` | `gzip:...` 或 `base64:...` 或 JSON 明文 | 多账号凭证数组，gzip 推荐用于多账号 |
+| `AISTUDIO_AUTH_ACCOUNT_1` … `_N` | 每个变量粘贴一个账号的 `storage-state.json` 文件完整内容（支持 `gzip:`/`base64:` 前缀） | **推荐**：逐账号注入，账户名自动从文件识别，详见第三章方式 A |
+| `AISTUDIO_AUTH_ACCOUNTS` | `gzip:...` 或 JSON 数组 | 备选：全部账号打包单变量，详见第三章方式 B（与编号变量互斥） |
 | `PROXY_API_KEY` | `sk-your-random-secret` | **必填**，公开 API 鉴权 key，否则任何人都能调用 |
 | `ADMIN_TOKEN` | `your-admin-secret` | **HF 必填**，管理端鉴权 token。不设置则 `/api/*` 和管理界面因 loopback 限制全部 403 |
 
@@ -213,7 +257,7 @@ git push space main
 
 | Name | Value | 说明 |
 |------|-------|------|
-| `AISTUDIO_ACTIVE_EMAIL` | `account1@gmail.com` | 启动时启用的账号（可选，默认第一个） |
+| `AISTUDIO_ACTIVE_EMAIL` | `account1@gmail.com` | 启动时启用的账号（可选，默认编号最小/数组第一个） |
 | `AISTUDIO_FAILOVER` | `true` | **HF 推荐**，active 账号失效自动切换到备用账号 |
 | `PROXY` | `http://your-proxy:port` | 可选，访问 Google 的代理（HF IP 可能被风控） |
 | `TZ` | `Asia/Shanghai` | 时区 |
@@ -226,7 +270,7 @@ git push space main
 Space 会自动构建 Docker 镜像并启动。可在 **Logs** 标签查看构建日志，应看到：
 
 ```
-环境变量凭证已就绪 accounts=account1@gmail.com,account2@gmail.com active=account1@gmail.com root=/app/auth
+环境变量凭证已就绪 source=AISTUDIO_AUTH_ACCOUNT_1..2 accounts=account1@gmail.com,account2@gmail.com active=account1@gmail.com root=/app/auth
 管理端鉴权已启用 | 模式=token
 账号失效自动切换已启用 check_interval=30s
 管理监听启动 | 地址=0.0.0.0:7860
@@ -402,12 +446,16 @@ GitHub Actions 推送到 GHCR 的镜像**默认是 private**。拉取前二选�
 1. 到 `https://github.com/users/<owner>/packages` 把 `aistudio2api` 的可见性改为 **Public**
 2. 或先 `docker login ghcr.io`（用 GitHub PAT，需 `read:packages` 权限）
 
-### Q8: 多账号凭证超过 HF Secrets 64KB 限制
+### Q8: 凭证超过 HF Secrets 64KB 限制
 
-使用 `gzip:` 前缀压缩。实测 10 个账号的 JSON 约 50KB，gzip 后约 8KB：
+编号变量方式（方式 A）每个账号独立一个 Secret，单账号 storage-state 通常 4-60KB，基本不会触限；数组方式（方式 B）多账号打包单变量最容易超。超限时对该值使用 `gzip:` 前缀：
 
 ```bash
+# 压缩整个数组(方式 B,实测 10 个账号约 50KB → 8KB)
 echo "gzip:$(gzip -c /tmp/auth.json | base64 -w0)"
+
+# 压缩单个账号文件(方式 A)
+echo "gzip:$(gzip -c auth-xxx.json | base64 -w0)"
 ```
 
 ### Q9: failover 没有触发
@@ -434,7 +482,8 @@ echo "gzip:$(gzip -c /tmp/auth.json | base64 -w0)"
 
 | 文件 | 状态 | 说明 |
 |------|------|------|
-| `internal/app/auth_env.go` | 新增 | 环境变量凭证注入,支持 JSON/base64/gzip 三种编码 |
+| `internal/app/auth_env.go` | 新增 | 环境变量凭证注入:每账号一个编号变量 `AISTUDIO_AUTH_ACCOUNT_1..N`(可直接粘贴 storage-state.json)或数组变量,支持 JSON/base64/gzip 三种编码 |
+| `internal/app/auth_env_test.go` | 新增 | 凭证注入单元测试(编号排序/重复检测/兜底标签/gzip 等 18 个用例) |
 | `internal/app/failover.go` | 新增 | active 账号失效自动切换监控（含切换中断自愈） |
 | `internal/app/failover_test.go` | 新增 | failover 行为单元测试（防震荡/自愈/字段保留等 9 个用例） |
 | `internal/app/app.go` | 修改 | 调用 `setupAuthFromEnv`、`startFailoverMonitor`，`rootHandler` 加 `ADMIN_TOKEN` |

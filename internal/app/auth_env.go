@@ -7,8 +7,11 @@ import (
         "encoding/json"
         "fmt"
         "log/slog"
+        "net/mail"
         "os"
         "path/filepath"
+        "sort"
+        "strconv"
         "strings"
 
         "github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -32,12 +35,31 @@ const authAccountsEnvVar = "AISTUDIO_AUTH_ACCOUNTS"
 // activeEmailEnvVar 指定启动时启用的账户邮箱；为空时启用列表中第一个
 const activeEmailEnvVar = "AISTUDIO_ACTIVE_EMAIL"
 
+// authAccountVarPrefix 是单账户编号环境变量的前缀，配合正整数编号使用：
+//   AISTUDIO_AUTH_ACCOUNT_1、AISTUDIO_AUTH_ACCOUNT_2 … AISTUDIO_AUTH_ACCOUNT_10、
+//   AISTUDIO_AUTH_ACCOUNT_11 ……编号无上限，按数值升序加载。
+//
+// 每个变量的值只放一个账户，支持两种 JSON 形态（均可叠加 base64:/gzip: 前缀）：
+//   1. storage-state.json 文件内容直接粘贴（顶层为 cookies/origins/accountName 等字段）
+//   2. 包装对象 {"email":"...","storage_state":{...},"proxy":"...","locale":"...","timezone":"..."}
+//
+// 账户目录名（邮箱标签）的解析优先级：包装对象 email > aistudio2api 扩展邮箱
+// > storage_state 的 accountName 根字段 > account-<编号>@env.local 兜底。
+//
+// 与 AISTUDIO_AUTH_ACCOUNTS（复数，数组格式）互斥，同时设置直接报错。
+const authAccountVarPrefix = "AISTUDIO_AUTH_ACCOUNT_"
+
 // setupAuthFromEnv 从环境变量加载多账户凭证并写入 AuthStates 目录
 //
+// 支持两种注入方式（互斥，同时设置报错）：
+//   - AISTUDIO_AUTH_ACCOUNTS：JSON 数组，一次注入全部账户
+//   - AISTUDIO_AUTH_ACCOUNT_1 / _2 / … / _10 / _11：每变量一个账户，
+//     可直接粘贴 storage-state.json 文件内容
+//
 // 行为:
-//   - 环境变量为空时跳过,保持原有目录扫描逻辑
-//   - 非空时清空目标目录下的旧账户,按 JSON 数组重新生成
-//   - 只有 ActiveEmail(或第一个)账户 Enabled=true,其余 Enabled=false
+//   - 两种方式均未设置时跳过，保持原有目录扫描逻辑
+//   - 非空时清空目标目录下的旧账户，重新生成
+//   - 只有 ActiveEmail(或编号最小/数组第一个)账户 Enabled=true，其余 Enabled=false
 //   - 单账户在线约束由 .env 中 WARM_WORKER_LIMIT=1 / MAX_ACTIVE_WORKERS=1 保证
 //
 // 编码格式(按前缀自动识别):
@@ -46,15 +68,37 @@ const activeEmailEnvVar = "AISTUDIO_ACTIVE_EMAIL"
 //   - "gzip:":       gzip 压缩 + base64 编码的 JSON(HF Secrets 64KB 限制场景)
 func setupAuthFromEnv(authStatesDir string) error {
         raw := strings.TrimSpace(os.Getenv(authAccountsEnvVar))
-        if raw == "" {
+        numbered, err := collectNumberedAuthVars()
+        if err != nil {
+                return err
+        }
+        if raw == "" && len(numbered) == 0 {
                 return nil
         }
-        payload, err := decodeAuthAccounts(raw)
-        if err != nil {
-                return fmt.Errorf("解析 %s: %w", authAccountsEnvVar, err)
+        if raw != "" && len(numbered) > 0 {
+                return fmt.Errorf("%s 与 %s<编号> 不能同时设置，请二选一", authAccountsEnvVar, authAccountVarPrefix)
+        }
+
+        var payload []authAccountEntry
+        source := authAccountsEnvVar
+        if raw != "" {
+                payload, err = decodeAuthAccounts(raw)
+                if err != nil {
+                        return fmt.Errorf("解析 %s: %w", authAccountsEnvVar, err)
+                }
+        } else {
+                source = fmt.Sprintf("%s1..%d", authAccountVarPrefix, numbered[len(numbered)-1].Number)
+                payload = make([]authAccountEntry, 0, len(numbered))
+                for _, item := range numbered {
+                        entry, entryErr := decodeSingleAuthVar(item)
+                        if entryErr != nil {
+                                return entryErr
+                        }
+                        payload = append(payload, entry)
+                }
         }
         if len(payload) == 0 {
-                return fmt.Errorf("%s 不能为空数组", authAccountsEnvVar)
+                return fmt.Errorf("注入的账户列表为空")
         }
 
         root, err := filepath.Abs(authStatesDir)
@@ -66,6 +110,17 @@ func setupAuthFromEnv(authStatesDir string) error {
         }
         if err := resetAuthRoot(root); err != nil {
                 return fmt.Errorf("清理旧账户目录: %w", err)
+        }
+
+        // 条目缺少 email 时:优先从 storage_state 的 accountName 根字段推导,
+        // 编号变量再兜底 account-<编号>@env.local,保证每个凭证都能确定目录名。
+        // 必须在默认 active 解析之前完成,否则无 email 条目无法选出默认账户
+        for index := range payload {
+                fallback := ""
+                if len(numbered) > 0 {
+                        fallback = fmt.Sprintf("account-%d@env.local", numbered[index].Number)
+                }
+                fillEntryEmailFallback(&payload[index], fallback)
         }
 
         activeEmail := strings.ToLower(strings.TrimSpace(os.Getenv(activeEmailEnvVar)))
@@ -92,6 +147,9 @@ func setupAuthFromEnv(authStatesDir string) error {
                 email, err := pickEntryEmail(entry)
                 if err != nil {
                         return fmt.Errorf("解析账户邮箱: %w", err)
+                }
+                if contains(installed, email) {
+                        return fmt.Errorf("账户 %s 重复注入: 请检查各凭证的 email/accountName 是否重复", email)
                 }
                 state, err := parseStorageState(entry.StorageState)
                 if err != nil {
@@ -141,6 +199,7 @@ func setupAuthFromEnv(authStatesDir string) error {
         }
 
         slog.Info("环境变量凭证已就绪",
+                "source", source,
                 "accounts", strings.Join(installed, ","),
                 "active", activeEmail,
                 "root", root,
@@ -155,44 +214,52 @@ func failoverEnabled() bool {
         return value == "true" || value == "1" || value == "yes"
 }
 
-// decodeAuthAccounts 解析环境变量值,支持 JSON 明文 / base64: / gzip: 三种格式
-//
-// gzip: 适用于 HF Secrets 64KB 限制场景
-// 生成命令: gzip -c auth.json | base64 -w0
+// decodeAuthAccounts 解析数组格式(兼容旧版)的凭证注入变量,支持 JSON 明文/base64:/gzip:
 func decodeAuthAccounts(raw string) ([]authAccountEntry, error) {
+        payload, err := decodeAuthPayload(raw)
+        if err != nil {
+                return nil, err
+        }
+        payload = strings.TrimSpace(payload)
+        if payload == "" {
+                return nil, nil
+        }
+        var entries []authAccountEntry
+        if err := json.Unmarshal([]byte(payload), &entries); err != nil {
+                return nil, fmt.Errorf("JSON 解析失败: %w", err)
+        }
+        return entries, nil
+}
+
+// decodeAuthPayload 去掉 base64:/gzip: 前缀,返回解码后的 JSON 文本
+//
+// gzip 生成命令: gzip -c auth.json | base64 -w0
+func decodeAuthPayload(raw string) (string, error) {
         switch {
         case strings.HasPrefix(raw, "gzip:"):
                 b64Data := strings.TrimPrefix(raw, "gzip:")
                 decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64Data))
                 if err != nil {
-                        return nil, fmt.Errorf("gzip base64 解码失败: %w", err)
+                        return "", fmt.Errorf("gzip base64 解码失败: %w", err)
                 }
                 gzReader, err := gzip.NewReader(bytes.NewReader(decoded))
                 if err != nil {
-                        return nil, fmt.Errorf("gzip reader 创建失败: %w", err)
+                        return "", fmt.Errorf("gzip reader 创建失败: %w", err)
                 }
                 defer gzReader.Close()
                 var buf bytes.Buffer
                 if _, err := buf.ReadFrom(gzReader); err != nil {
-                        return nil, fmt.Errorf("gzip 解压失败: %w", err)
+                        return "", fmt.Errorf("gzip 解压失败: %w", err)
                 }
-                raw = buf.String()
+                return buf.String(), nil
         case strings.HasPrefix(raw, "base64:"):
                 decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(raw, "base64:"))
                 if err != nil {
-                        return nil, fmt.Errorf("base64 解码失败: %w", err)
+                        return "", fmt.Errorf("base64 解码失败: %w", err)
                 }
-                raw = string(decoded)
+                return string(decoded), nil
         }
-        raw = strings.TrimSpace(raw)
-        if raw == "" {
-                return nil, nil
-        }
-        var entries []authAccountEntry
-        if err := json.Unmarshal([]byte(raw), &entries); err != nil {
-                return nil, fmt.Errorf("JSON 解析失败: %w", err)
-        }
-        return entries, nil
+        return raw, nil
 }
 
 // pickEntryEmail 从条目中提取小写邮箱
@@ -274,4 +341,144 @@ func contains(values []string, target string) bool {
                 }
         }
         return false
+}
+
+// numberedAuthVar 记录一个编号账户环境变量
+type numberedAuthVar struct {
+        Number int
+        Key    string
+        Value  string
+}
+
+// collectNumberedAuthVars 扫描进程中所有 AISTUDIO_AUTH_ACCOUNT_<数字> 变量,
+// 按编号数值升序返回(字典序会把 _10 排在 _2 之前,必须数值排序)。
+//
+// 命名约束:
+//   - 后缀必须是纯数字正整数,允许前导零但按数值归一
+//   - 同一编号只能出现一次(_1 与 _01 视为重复,直接报错)
+//   - 变量值不能为空
+//   - 非数字后缀(如 AISTUDIO_AUTH_ACCOUNT_ONE)视为命名错误,
+//     避免拼错编号导致账户被静默丢弃
+func collectNumberedAuthVars() ([]numberedAuthVar, error) {
+        found := make([]numberedAuthVar, 0, 8)
+        seen := make(map[int]string)
+        for _, item := range os.Environ() {
+                key, value, _ := strings.Cut(item, "=")
+                if !strings.HasPrefix(key, authAccountVarPrefix) {
+                        continue
+                }
+                suffix := strings.TrimPrefix(key, authAccountVarPrefix)
+                if suffix == "" || !isAllDigits(suffix) {
+                        return nil, fmt.Errorf("环境变量 %s 命名无效: 后缀必须是正整数编号(如 %s1、%s10)",
+                                key, authAccountVarPrefix, authAccountVarPrefix)
+                }
+                number, err := strconv.Atoi(suffix)
+                if err != nil || number < 1 {
+                        return nil, fmt.Errorf("环境变量 %s 编号超出支持范围", key)
+                }
+                if previous, exists := seen[number]; exists {
+                        return nil, fmt.Errorf("账户编号 %d 重复: %s 与 %s 指向同一编号", number, previous, key)
+                }
+                seen[number] = key
+                trimmed := strings.TrimSpace(value)
+                if trimmed == "" {
+                        return nil, fmt.Errorf("环境变量 %s 为空: 未提供账户凭证", key)
+                }
+                found = append(found, numberedAuthVar{Number: number, Key: key, Value: trimmed})
+        }
+        sort.Slice(found, func(left, right int) bool {
+                return found[left].Number < found[right].Number
+        })
+        return found, nil
+}
+
+// isAllDigits 判断字符串是否全为 ASCII 数字且非空
+func isAllDigits(value string) bool {
+        if value == "" {
+                return false
+        }
+        for _, char := range value {
+                if char < '0' || char > '9' {
+                        return false
+                }
+        }
+        return true
+}
+
+// decodeSingleAuthVar 解析单个编号账户变量的值。
+//
+// 支持两种 JSON 形态(均可叠加 base64:/gzip: 前缀):
+//  1. storage-state.json 文件内容直接粘贴(顶层为 cookies/origins/accountName 等)
+//  2. 包装对象 {"email":"...","storage_state":{...},"proxy":"...","locale":"...","timezone":"..."}
+//
+// 数组形态属于 AISTUDIO_AUTH_ACCOUNTS(复数)专用,在此直接报错并给出提示。
+func decodeSingleAuthVar(item numberedAuthVar) (authAccountEntry, error) {
+        payload, err := decodeAuthPayload(item.Value)
+        if err != nil {
+                return authAccountEntry{}, fmt.Errorf("解析 %s: %w", item.Key, err)
+        }
+        payload = strings.TrimSpace(payload)
+        if payload == "" {
+                return authAccountEntry{}, fmt.Errorf("%s 解码后内容为空", item.Key)
+        }
+        if payload[0] == '[' {
+                return authAccountEntry{}, fmt.Errorf("%s 的值是数组: 单账户编号变量请直接粘贴 storage-state.json 或使用包装对象,多账户数组请改用 %s",
+                        item.Key, authAccountsEnvVar)
+        }
+        var probe map[string]json.RawMessage
+        if err := json.Unmarshal([]byte(payload), &probe); err != nil {
+                return authAccountEntry{}, fmt.Errorf("%s JSON 解析失败: %w", item.Key, err)
+        }
+        var entry authAccountEntry
+        if _, wrapped := probe["storage_state"]; wrapped {
+                if err := json.Unmarshal([]byte(payload), &entry); err != nil {
+                        return authAccountEntry{}, fmt.Errorf("%s JSON 解析失败: %w", item.Key, err)
+                }
+                return entry, nil
+        }
+        // 整个对象就是 storage state,原样交给 entry.StorageState,
+        // 后续 parseStorageState/Signer 会校验其完整性
+        entry.StorageState = json.RawMessage(payload)
+        return entry, nil
+}
+
+// storageStateAccountEmail 尝试从 storage state 的 accountName 根字段提取邮箱。
+// 该字段常见于手工导出的凭证文件,项目运行时不依赖它,
+// 仅在条目缺少 email 与 aistudio2api 扩展时用作账户目录名的兜底来源。
+func storageStateAccountEmail(raw json.RawMessage) string {
+        if len(raw) == 0 {
+                return ""
+        }
+        var probe struct {
+                AccountName string `json:"accountName"`
+        }
+        if err := json.Unmarshal(raw, &probe); err != nil {
+                return ""
+        }
+        candidate := strings.TrimSpace(probe.AccountName)
+        if candidate == "" {
+                return ""
+        }
+        address, err := mail.ParseAddress(candidate)
+        if err != nil || !strings.EqualFold(strings.TrimSpace(address.Address), candidate) {
+                return ""
+        }
+        return strings.ToLower(address.Address)
+}
+
+// fillEntryEmailFallback 为缺少 email 的条目补齐账户标签:
+// 显式 email 与 aistudio2api 扩展邮箱优先(见 pickEntryEmail),
+// 其次 storage_state 的 accountName 根字段,最后编号兜底(数组格式无编号则不兜底,
+// 保持原有"缺少 email"报错行为)
+func fillEntryEmailFallback(entry *authAccountEntry, fallback string) {
+        if _, err := pickEntryEmail(*entry); err == nil {
+                return
+        }
+        if email := storageStateAccountEmail(entry.StorageState); email != "" {
+                entry.Email = email
+                return
+        }
+        if fallback != "" {
+                entry.Email = fallback
+        }
 }
