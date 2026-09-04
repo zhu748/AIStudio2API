@@ -12,7 +12,7 @@
 | 多账号 | 启动时把所有账号写入 `/app/auth/<email>/`，AccountStore 自动加载 |
 | 单账号在线 | 默认仅 `AISTUDIO_ACTIVE_EMAIL`（或第一个）账号 `Enabled=true`，其余 `Enabled=false` |
 | 账号切换 | 复用 Web 管理界面"账户"页：停用当前账号 → 启用目标账号，无需重启；或通过 `PUT /api/accounts/{id}` API |
-| 自动 failover | `AISTUDIO_FAILOVER=true` 时后台监控 active 账号失效，自动切换到备用账号 |
+| 自动 failover | `AISTUDIO_FAILOVER=true` 时后台监控 active 账号失效，自动切换到备用账号（失效账号拉黑防震荡） |
 | 管理端鉴权 | `ADMIN_TOKEN` 非空时启用 token 鉴权（HF 必填，否则管理操作被 loopback 限制 403） |
 | 监听端口 | `0.0.0.0:7860`（HF Spaces 强制端口） |
 | 健康检查 | `/health` 在服务未就绪时返回 503，避免 HF 提前路由流量导致 502 |
@@ -158,6 +158,29 @@ gzip 实测压缩率：1.5KB → 412B（约 73% 压缩）。多账号场景几�
 
 ### 2. 上传代码
 
+#### 方式 A：GitHub Actions 自动同步（推荐）
+
+仓库自带两条 CI 工作流，push 到 main 后全自动完成"构建镜像 → 推送 GHCR → 同步代码到 HF Space"：
+
+```
+push/手动触发
+  └─ docker-publish.yml   构建 Docker 镜像 → 推送 ghcr.io/<owner>/aistudio2api
+      └─ huggingface-sync.yml (workflow_call) → 幂等创建/复用 HF Space → 强推源码
+```
+
+在 GitHub 仓库 **Settings → Secrets and variables → Actions** 配置：
+
+| 类型 | Name | Value |
+|------|------|-------|
+| Secret | `HF_TOKEN` | HuggingFace Access Token（需 write 权限，https://huggingface.co/settings/tokens 创建） |
+| Variable | `HF_SPACE_OWNER` | 你的 HF 用户名或组织名 |
+
+配置完成后 push 到 main 即自动触发。Space 不存在时 workflow 会自动创建（默认 **private** + Docker SDK）。
+
+> 未配置 `HF_TOKEN` / `HF_SPACE_OWNER` 时同步步骤自动跳过（仅告警不失败），不影响镜像构建。
+
+#### 方式 B：手动推送
+
 将本仓库（含改造后的 Dockerfile、`internal/app/auth_env.go`、`internal/app/app.go` 修改）推送到 Space：
 
 ```bash
@@ -250,9 +273,10 @@ curl -X PUT "https://<user>-aistudio2api.hf.space/api/accounts/account2@gmail.co
 
 设置 `AISTUDIO_FAILOVER=true`（Docker 镜像默认开启）。后台每 30 秒检查一次：
 - 若 active 账号变为 `auth_required` 或 `unavailable`
-- 自动禁用当前账号
-- 自动启用列表中第一个 `ready` 状态的备用账号
-- 全程无需人工干预
+- 自动禁用当前账号，并将其拉黑（本进程内不再选中，防止失效账号被反复启用震荡切换）
+- 自动启用列表中下一个未被拉黑的备用账号
+- 若备用账号启用后也失效，下一轮检查会继续切换，最终收敛到健康账号
+- 全程无需人工干预；进程重启后拉黑状态清零、账号状态从环境变量重新注入
 
 ### 重启后行为
 
@@ -374,9 +398,10 @@ echo "gzip:$(gzip -c /tmp/auth.json | base64 -w0)"
 ### Q9: failover 没有触发
 
 - 确认 `AISTUDIO_FAILOVER=true` 已设置（Docker 镜像默认开启）
-- 确认备用账号在注入时 `Enabled=false`（active 账号失效后才会被启用）
+- 确认 `AISTUDIO_AUTH_ACCOUNTS` 中有多个账号（仅一个账号时无备用可切）
 - 查看日志中是否有 `触发自动账号切换` 字样
 - failover 每 30 秒检查一次，最多有 30s 延迟
+- 若日志出现 `failover 无可用备用账号`，说明所有备用账号均已失效，需更新 `AISTUDIO_AUTH_ACCOUNTS` 后重启 Space
 
 ### Q10: 健康检查返回 503
 
@@ -400,6 +425,8 @@ echo "gzip:$(gzip -c /tmp/auth.json | base64 -w0)"
 | `internal/api/middleware.go` | 修改 | 新增 `AdminAuthMiddleware`（X-Admin-Token / Basic Auth / ?admin_token=） |
 | `internal/api/admin.go` | 修改 | `/health` 智能返回 503（服务未就绪时） |
 | `Dockerfile` | 新增 | 多阶段构建 + Camoufox 动态版本 + HF 默认环境变量 |
+| `.github/workflows/docker-publish.yml` | 新增 | CI: 构建镜像推送 GHCR，并通过 workflow_call 链式触发 HF 同步 |
+| `.github/workflows/huggingface-sync.yml` | 新增 | CI: 幂等创建 HF Space（private + Docker SDK）并强推源码，支持手动/链式触发 |
 | `.dockerignore` | 新增 | 排除运行时数据和构建产物 |
 | `.env.example` | 修改 | 增加 HF 部署相关变量说明（`ADMIN_TOKEN`、`AISTUDIO_FAILOVER` 等） |
 | `README_HF.md` | 新增 | 本文档 |

@@ -26,7 +26,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
 
     steps:
       - name: Checkout
@@ -99,10 +98,14 @@ jobs:
           echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - name: Trigger HuggingFace sync
+      - name: Sync to HuggingFace Space
+        # 复用 huggingface-sync.yml 的 workflow_call 入口
+        # (原先用 benc-uk/workflow-dispatch 触发 workflow_dispatch,
+        #  需要 actions:write 权限,GITHUB_TOKEN 默认没有,会 403 失败;
+        #  reusable workflow 无此问题,且 secrets: inherit 可传递 HF_TOKEN)
         if: github.ref == 'refs/heads/main' || github.ref_type == 'tag'
-        uses: benc-uk/workflow-dispatch@v1.2.4
+        uses: ./.github/workflows/huggingface-sync.yml
         with:
-          workflow: huggingface-sync.yml
-          ref: ${{ github.event.inputs.ref || github.ref }}
-          inputs: '{ "image_tag": "${{ steps.meta.outputs.version }}", "digest": "${{ steps.build.outputs.digest }}" }'
+          image_tag: ${{ steps.meta.outputs.version }}
+          digest: ${{ steps.build.outputs.digest }}
+        secrets: inherit

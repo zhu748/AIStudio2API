@@ -1,15 +1,15 @@
 name: Sync to HuggingFace Space
 
-# 一键同步代码到 HuggingFace Spaces Docker 仓库
+# 同步代码到 HuggingFace Spaces Docker 仓库
 # HF Spaces 会自动从 Space 仓库读取 Dockerfile 并构建
 #
 # 必需 Secrets(在 GitHub repo Settings → Secrets and variables → Actions 添加):
 #   - HF_TOKEN: HuggingFace Access Token(需 write 权限)
-# 必需 Variables(在 Settings → Secrets → Variables for Actions 添加):
+# 必需 Variables(在 Settings → Secrets and Variables → Actions 添加):
 #   - HF_SPACE_OWNER: HF 用户名或组织名(例如 your-username)
 #
 # 触发:
-#   - docker-publish 工作流完成后自动调用
+#   - docker-publish 工作流通过 workflow_call 自动调用(推荐链路)
 #   - 手动触发(workflow_dispatch)
 on:
   workflow_dispatch:
@@ -43,16 +43,19 @@ jobs:
     steps:
       - name: Check HF credentials
         id: check
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_OWNER: ${{ vars.HF_SPACE_OWNER }}
         run: |
-          if [ -z "${{ secrets.HF_TOKEN }}" ]; then
+          if [ -z "$HF_TOKEN" ]; then
             echo "::warning::HF_TOKEN secret 未设置,跳过 HF 同步"
             echo "skip=true" >> $GITHUB_OUTPUT
-          elif [ -z "${{ vars.HF_SPACE_OWNER }}" ]; then
+          elif [ -z "$HF_SPACE_OWNER" ]; then
             echo "::warning::HF_SPACE_OWNER variable 未设置,跳过 HF 同步"
             echo "skip=true" >> $GITHUB_OUTPUT
           else
             echo "skip=false" >> $GITHUB_OUTPUT
-            echo "Will sync to https://huggingface.co/spaces/${{ vars.HF_SPACE_OWNER }}/aistudio2api"
+            echo "Will sync to https://huggingface.co/spaces/$HF_SPACE_OWNER/aistudio2api"
           fi
 
       - name: Checkout source
@@ -62,9 +65,42 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Remove files not needed on HF Space
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          rm -rf .github
+          rm -f start.bat docker-compose.yml .env.example
+          echo "=== Space 仓库文件清单 ==="
+          ls -A
+
       - name: Remove git history
         if: steps.check.outputs.skip != 'true'
         run: rm -rf .git
+
+      - name: Ensure HF Space exists
+        # 幂等创建 Space(已存在时 no-op),避免 git push 到不存在的仓库失败
+        # 默认创建为 private(与 README_HF.md 建议一致)
+        if: steps.check.outputs.skip != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_REPO: ${{ vars.HF_SPACE_OWNER }}/aistudio2api
+        run: |
+          pip install --quiet huggingface_hub
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          repo_id = os.environ["HF_SPACE_REPO"]
+          api.create_repo(
+              repo_id=repo_id,
+              repo_type="space",
+              space_sdk="docker",
+              private=True,
+              exist_ok=True,
+          )
+          print(f"Space ready: {repo_id}")
+          PY
 
       - name: Prepare HF Space metadata
         if: steps.check.outputs.skip != 'true'
@@ -77,7 +113,6 @@ jobs:
           colorFrom: blue
           colorTo: green
           sdk: docker
-          sdk_version: latest
           app_port: 7860
           pinned: false
           license: mit
@@ -91,6 +126,8 @@ jobs:
           with open('README.md') as f:
               content = f.read()
           content = re.sub(r'sdk:\s*\w+', 'sdk: docker', content, count=1)
+          # Docker Space 没有 sdk_version 字段,删除避免 HF 元数据解析警告
+          content = re.sub(r'sdk_version:\s*\S+\n', '', content)
           if 'app_port:' not in content:
               content = content.replace('sdk: docker', 'sdk: docker\napp_port: 7860', 1)
           else:
@@ -142,5 +179,5 @@ jobs:
           echo "   - \`AISTUDIO_AUTH_ACCOUNTS\` (gzip: 前缀的多账号 JSON)" >> $GITHUB_STEP_SUMMARY
           echo "   - \`PROXY_API_KEY\` (API 调用密钥)" >> $GITHUB_STEP_SUMMARY
           echo "   - \`ADMIN_TOKEN\` (管理端鉴权)" >> $GITHUB_STEP_SUMMARY
-          echo "2. 等待 Space 自动构建(约 5-10 分钟)" >> $GITHUB_STEP_SUMMARY
+          echo "2. 等待 Space 自动构建(约 10-30 分钟,含 Camoufox 下载)" >> $GITHUB_STEP_SUMMARY
           echo "3. 访问 App URL,用 ADMIN_TOKEN 通过 Basic Auth 登录" >> $GITHUB_STEP_SUMMARY

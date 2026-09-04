@@ -34,8 +34,6 @@ services:
     volumes:
       # 持久化 auth 目录(可选,重启后凭证不丢失)
       - ./data/auth:/app/auth
-      # 持久化 Camoufox profile(可选,加速重启)
-      - ./data/runtime:/app/runtime
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7860/health"]
       interval: 30s

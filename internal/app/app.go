@@ -119,6 +119,7 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
         if adminToken != "" {
                 manager.requests.log("service", "INFO", "管理端鉴权已启用 | 模式=token")
         }
+        warnExposedAPIWithoutKey(cfg, manager)
         apiHandler := api.NewHandler(manager, api.Config{APIKey: cfg.ProxyAPIKey, AdminToken: adminToken, Admin: manager})
         server := &http.Server{
                 Handler:           rootHandler(apiHandler, adminToken),
@@ -179,6 +180,35 @@ func rootHandler(apiHandler http.Handler, adminToken string) http.Handler {
         }
         root.Handle("/", webHandler)
         return root
+}
+
+// warnExposedAPIWithoutKey 在公开监听但未设置 PROXY_API_KEY 时输出告警
+//
+// 空的 PROXY_API_KEY 会让 authMiddleware 放行所有请求,
+// 容器/HuggingFace 等非 loopback 部署忘记配置密钥时 API 将完全暴露
+func warnExposedAPIWithoutKey(cfg config.Config, manager *runtimeManager) {
+        if strings.TrimSpace(cfg.ProxyAPIKey) != "" {
+                return
+        }
+        host, _, err := net.SplitHostPort(strings.TrimSpace(cfg.ListenAddr))
+        if err != nil {
+                return
+        }
+        if host == "" {
+                host = "0.0.0.0"
+        }
+        if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+                return
+        }
+        if strings.EqualFold(host, "localhost") {
+                return
+        }
+        manager.requests.log("service", "WARN",
+                "PROXY_API_KEY 未设置且监听非 loopback | 公开 API 将无鉴权,任何人都可以调用")
+        slog.Warn("PROXY_API_KEY 未设置且监听地址对外开放,公开 API 处于无鉴权状态",
+                "listen", cfg.ListenAddr,
+                "hint", "请在环境变量或 .env 中设置 PROXY_API_KEY",
+        )
 }
 
 // browserAddress 将通配监听地址转换为本机可访问地址

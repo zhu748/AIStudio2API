@@ -44,9 +44,11 @@ RUN apt-get update && \
     CAMOUFOX_VERSION=$(grep -oE 'camoufoxRelease = "[^"]+"' /tmp/download.go | head -1 | sed -E 's/.*"([^"]+)".*/\1/') && \
     test -n "$CAMOUFOX_VERSION" && \
     echo "Camoufox version: $CAMOUFOX_VERSION" && \
-    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --progress-bar \
+    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+      --silent --show-error \
       -o /tmp/camoufox.zip \
       "https://github.com/daijro/camoufox/releases/download/v${CAMOUFOX_VERSION}/camoufox-${CAMOUFOX_VERSION}-lin.x86_64.zip" && \
+    echo "Camoufox ${CAMOUFOX_VERSION} 下载完成 $(du -h /tmp/camoufox.zip | cut -f1)" && \
     mkdir -p /camoufox && \
     unzip -q /tmp/camoufox.zip -d /camoufox && \
     rm /tmp/camoufox.zip /tmp/download.go && \
@@ -70,7 +72,7 @@ RUN apt-get update && \
       libxcomposite1 libxcursor1 libxdamage1 \
       libxext6 libxfixes3 libxi6 \
       libxrandr2 libxrender1 libxss1 \
-      libxtst6 libxinerama1 \
+      libxtst6 libxinerama1 libxt6 \
       libpango-1.0-0 libpangocairo-1.0-0 \
       libcairo2 libatk1.0-0 libatk-bridge2.0-0 \
       libdrm2 libgbm1 libglib2.0-0 \
@@ -118,5 +120,6 @@ ENV LISTEN_ADDR=0.0.0.0:7860 \
 CMD ["/app/aistudio2api", "-open-ui=false"]
 
 # 健康检查: /health 在服务未就绪时返回 503(HF 据此决定是否路由流量)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+# start-period 180s: HF 网络慢 + Camoufox 首次预热可能超 120s,给足余量
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
     CMD curl -fsS http://127.0.0.1:7860/health || exit 1
