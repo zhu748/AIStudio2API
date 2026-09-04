@@ -1,0 +1,73 @@
+name: CI
+
+# 代码质量检查: Go 编译/vet + 前端类型检查
+# 在 PR 与 push 时先于 Docker 构建发现问题,反馈更快
+#
+# 触发:
+#   - push 到 main(与 docker-publish 并行,失败时 PR 徽标可见)
+#   - pull_request
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Go & Frontend Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # go:embed 要求 internal/webui/dist 存在,PR 环境无构建产物时放置占位文件
+      # (Docker 构建中由 frontend stage 生成真实产物)
+      - name: Placeholder web UI dist for go:embed
+        run: |
+          mkdir -p internal/webui/dist
+          echo '<!DOCTYPE html><html><body>placeholder</body></html>' > internal/webui/dist/index.html
+
+      - name: Go module download
+        run: go mod download
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go build
+        run: go build ./...
+
+      - name: Frontend install
+        working-directory: web
+        run: npm ci
+
+      - name: Frontend typecheck
+        working-directory: web
+        run: npm run typecheck
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## CI Checks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- go vet: done" >> $GITHUB_STEP_SUMMARY
+          echo "- go build: done" >> $GITHUB_STEP_SUMMARY
+          echo "- vue-tsc typecheck: done" >> $GITHUB_STEP_SUMMARY

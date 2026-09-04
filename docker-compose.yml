@@ -6,8 +6,14 @@
 #   3. 启动: docker compose up -d
 #   4. 访问: http://localhost:7860 (Basic Auth 用户名 = ADMIN_TOKEN, 密码留空)
 #
+# 注意: 容器以 UID 1000 运行(与 HuggingFace Spaces 行为一致)。
+# 使用下方 data/auth 卷挂载前,请先确保宿主目录存在且 UID 1000 可写:
+#   mkdir -p data/auth && sudo chown -R 1000:1000 data
+# (Docker 自动创建缺失的挂载目录时默认 root:root,会导致容器写入 permission denied)
+#
 # 使用 GHCR 预构建镜像(推荐,无需本地构建):
 #   docker compose up -d
+#   注意: GHCR 镜像默认 private,拉取前需将 Package 可见性改为 Public 或先 docker login ghcr.io
 #
 # 强制本地构建:
 #   docker compose up -d --build
@@ -33,6 +39,7 @@ services:
       TEMPORARY_CHAT: "true"
     volumes:
       # 持久化 auth 目录(可选,重启后凭证不丢失)
+      # 注意: 宿主目录需 UID 1000 可写,见文件头部说明
       - ./data/auth:/app/auth
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7860/health"]

@@ -2,37 +2,50 @@
 # AIStudio2API HuggingFace Spaces Docker 镜像
 #
 # 设计:
-#   - 多阶段构建,build stage 用 Go 1.26 + Node 24 编译前后端
-#   - runtime stage 用 Ubuntu 22.04,安装 Firefox/Camoufox 运行时依赖
-#   - Camoufox 在 build stage 预下载到镜像,避免 HF 网络不稳定
-#   - 单账户在线: WARM_WORKER_LIMIT=1 / MAX_ACTIVE_WORKERS=1
+#   - 四阶段构建:
+#       frontend  node:24 官方镜像构建 Vue 前端(替代已弃用的 NodeSource 脚本)
+#       builder   golang:1.26 编译后端,go mod 与 npm ci 分层缓存
+#       camoufox  预下载 Camoufox 到镜像,避免 HF 网络不稳定
+#       runtime   ubuntu 22.04 + Firefox/Camoufox 运行时依赖
+#   - HF Spaces 强制以 UID 1000 运行容器(官方文档),镜像必须预先
+#     以 1000 属主准备好可写目录,否则 /app/auth 写入直接 permission denied
+#   - Camoufox 以非 root 运行: root 身份跑浏览器会暴露大量自动化特征
 #   - 监听 0.0.0.0:7860(HF Spaces 强制端口)
 #   - 多账户凭证通过 AISTUDIO_AUTH_ACCOUNTS 环境变量注入
 
-# ============================== build stage ==============================
-FROM golang:1.26-bookworm AS builder
-
-# 安装 Node.js 24(用于构建 Vue 前端)
-RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs git ca-certificates unzip && \
-    rm -rf /var/lib/apt/lists/*
+# ============================== frontend stage ==============================
+# 使用官方 Node 镜像而非 NodeSource curl|bash 脚本(NodeSource 旧式
+# setup_*.x 脚本已弃用且依赖第三方网络),官方镜像更快更可靠
+FROM node:24-bookworm-slim AS frontend
 
 WORKDIR /src
 
-# 先复制模块文件利用缓存
+# 先复制依赖清单,仅当 lockfile 变化时才重新 npm ci(层缓存)
+COPY web/package.json web/package-lock.json ./web/
+RUN cd web && npm ci
+
+# 复制前端源码并构建,vite 按 outDir 输出到 /src/internal/webui/dist
+COPY web/ ./web/
+RUN cd web && npm run build && test -f /src/internal/webui/dist/index.html
+
+# =============================== builder stage ===============================
+FROM golang:1.26-bookworm AS builder
+
+WORKDIR /src
+
+# 先复制模块文件,仅当 go.mod/go.sum 变化时才重新下载依赖(层缓存)
 COPY go.mod go.sum ./
 RUN go mod download
 
+# 复制源码与前端产物(前端产物由 frontend stage 生成)
 COPY . .
+COPY --from=frontend /src/internal/webui/dist ./internal/webui/dist
 
-# 构建前端 -> 输出到 internal/webui/dist
-RUN cd web && npm ci && npm run build
-
-# 构建后端二进制
+# 构建后端二进制(纯静态,CGO 关闭;modernc.org/sqlite 为纯 Go 实现)
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" -o /out/aistudio2api ./cmd/aistudio2api
 
-# ============================ camoufox stage ============================
+# ============================= camoufox stage =============================
 FROM ubuntu:22.04 AS camoufox
 
 # 从源码动态读取 Camoufox 版本,避免与代码常量不同步
@@ -55,7 +68,7 @@ RUN apt-get update && \
     chmod +x /camoufox/camoufox-bin && \
     test -x /camoufox/camoufox-bin
 
-# ============================ runtime stage ============================
+# ============================= runtime stage =============================
 FROM ubuntu:22.04 AS runtime
 
 # Firefox/Camoufox 运行时依赖(GTK3, X11, NSS, ALSA, dbus-glib, 字体, curl for healthcheck)
@@ -81,20 +94,35 @@ RUN apt-get update && \
       dbus-x11 \
     && rm -rf /var/lib/apt/lists/*
 
+# 非 root 运行用户,UID 固定 1000:
+#   - HF Spaces 无论 Dockerfile 如何声明都以 UID 1000 运行容器,
+#     显式创建同名用户可保证本地 docker run 与 HF 行为一致
+#   - Camoufox/Firefox 以 root 运行会暴露自动化特征(/proc/self、
+#     HOME 属主等可被页面 JS 检测),非 root 是反指纹的基本要求
+RUN useradd --uid 1000 --user-group --create-home --shell /usr/sbin/nologin appuser
+
 WORKDIR /app
 
-# 拷贝二进制和 Camoufox
+# 拷贝二进制与 Camoufox
+# 注意: --chown 自 Docker 17.09 起被经典构建器支持;但 --chmod 是 BuildKit
+# 专属特性,为确保 HF Spaces 构建器兼容性,可执行位用 RUN chmod 设置
 COPY --from=builder /out/aistudio2api /app/aistudio2api
-COPY --from=camoufox /camoufox /app/runtime/camoufox
+COPY --from=camoufox --chown=1000:1000 /camoufox /app/runtime/camoufox
+RUN chmod +x /app/aistudio2api /app/runtime/camoufox/camoufox-bin
 
-# 运行时目录
-RUN mkdir -p /app/auth && \
-    chmod +x /app/aistudio2api /app/runtime/camoufox/camoufox-bin
+# 运行时可写目录:账户配置/凭证(runtime-state、.leases 均在 auth 下);
+# runtime 授权保证 CAMOUFOX_PATH 失效时的自动安装回退路径可写;
+# Camoufox profile 使用 /tmp(粘滞位,任何用户可写),无需额外授权
+RUN mkdir -p /app/auth /app/runtime && chown -R 1000:1000 /app/auth /app/runtime
+
+USER appuser
+ENV HOME=/home/appuser
 
 # HuggingFace Spaces 强制 7860 端口
 EXPOSE 7860
 
 # 默认环境变量(可被 HF Spaces Variables 覆盖)
+# GOMEMLIMIT 为 Go 运行时软内存上限,可在 HF Variables 按需覆盖(如 8GiB)
 ENV LISTEN_ADDR=0.0.0.0:7860 \
     AISTUDIO_AUTH_STATES=/app/auth \
     CAMOUFOX_PATH=/app/runtime/camoufox/camoufox-bin \

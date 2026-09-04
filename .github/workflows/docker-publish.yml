@@ -19,6 +19,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# 同一分支/ tag 连续 push 时自动取消过时构建,节省 Actions 配额
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build & Push Docker Image
@@ -33,9 +38,7 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
+      # 仅构建 linux/amd64(HF Spaces 与主流 VPS 均为 amd64),无需 QEMU 模拟
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -89,6 +92,9 @@ jobs:
           echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 一键部署" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> ⚠️ GHCR 镜像默认为 private。本地 \`docker run\` 拉取前需到 [Package 设置](https://github.com/users/${{ github.actor }}/packages) 将可见性改为 Public(或先 \`docker login ghcr.io\`)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
           echo "docker run -d --name aistudio2api \\" >> $GITHUB_STEP_SUMMARY
           echo "  -p 7860:7860 \\" >> $GITHUB_STEP_SUMMARY

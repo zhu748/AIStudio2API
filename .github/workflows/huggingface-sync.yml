@@ -36,6 +36,11 @@ on:
 env:
   HF_SPACE_REPO: ${{ vars.HF_SPACE_OWNER }}/aistudio2api
 
+# 同一 ref 的同步任务自动取消过时的(链式调用时由调用方控制,手动触发时生效)
+concurrency:
+  group: huggingface-sync-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   sync:
     name: Sync to HuggingFace Space

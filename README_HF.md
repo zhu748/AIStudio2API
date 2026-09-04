@@ -18,6 +18,7 @@
 | 健康检查 | `/health` 在服务未就绪时返回 503，避免 HF 提前路由流量导致 502 |
 | 并发约束 | `WARM_WORKER_LIMIT=1`、`MAX_ACTIVE_WORKERS=1`、`WARM_STARTUP_CONCURRENCY=1` |
 | Camoufox | Docker 镜像中预下载，版本号从源码动态读取，避免与代码常量不同步 |
+| 运行用户 | 镜像内置 UID 1000 非 root 用户，与 HF Spaces 强制运行用户一致（同时避免浏览器以 root 运行暴露自动化特征） |
 
 ---
 
@@ -160,9 +161,12 @@ gzip 实测压缩率：1.5KB → 412B（约 73% 压缩）。多账号场景几�
 
 #### 方式 A：GitHub Actions 自动同步（推荐）
 
-仓库自带两条 CI 工作流，push 到 main 后全自动完成"构建镜像 → 推送 GHCR → 同步代码到 HF Space"：
+仓库自带三条 CI 工作流：
 
 ```
+push/PR
+  └─ ci.yml              PR 质量门禁: go vet + go build + 前端 vue-tsc 类型检查
+
 push/手动触发
   └─ docker-publish.yml   构建 Docker 镜像 → 推送 ghcr.io/<owner>/aistudio2api
       └─ huggingface-sync.yml (workflow_call) → 幂等创建/复用 HF Space → 强推源码
@@ -175,9 +179,11 @@ push/手动触发
 | Secret | `HF_TOKEN` | HuggingFace Access Token（需 write 权限，https://huggingface.co/settings/tokens 创建） |
 | Variable | `HF_SPACE_OWNER` | 你的 HF 用户名或组织名 |
 
-配置完成后 push 到 main 即自动触发。Space 不存在时 workflow 会自动创建（默认 **private** + Docker SDK）。
+配置完成后 push 到 main 即自动触发（同分支连续 push 会自动取消过时构建）。Space 不存在时 workflow 会自动创建（默认 **private** + Docker SDK）。
 
 > 未配置 `HF_TOKEN` / `HF_SPACE_OWNER` 时同步步骤自动跳过（仅告警不失败），不影响镜像构建。
+>
+> 注意：推送到 GHCR 的镜像默认 private，本地 `docker run ghcr.io/...` 拉取前需将 Package 可见性改为 Public（见 Q7b）。
 
 #### 方式 B：手动推送
 
@@ -387,6 +393,14 @@ docker run -p 7860:7860 \
 
 浏览器访问 `http://localhost:7860`，Basic Auth 用户名填 `admin456`，密码留空。
 
+> 提示：镜像以 UID 1000 运行（与 HF Spaces 行为一致）。如挂载数据卷，宿主目录需预先 `chown 1000:1000`，否则容器内写入会 permission denied。
+
+### Q7b: 拉取 GHCR 预构建镜像报 denied
+
+GitHub Actions 推送到 GHCR 的镜像**默认是 private**。拉取前二选一：
+1. 到 `https://github.com/users/<owner>/packages` 把 `aistudio2api` 的可见性改为 **Public**
+2. 或先 `docker login ghcr.io`（用 GitHub PAT，需 `read:packages` 权限）
+
 ### Q8: 多账号凭证超过 HF Secrets 64KB 限制
 
 使用 `gzip:` 前缀压缩。实测 10 个账号的 JSON 约 50KB，gzip 后约 8KB：
@@ -424,7 +438,8 @@ echo "gzip:$(gzip -c /tmp/auth.json | base64 -w0)"
 | `internal/api/router.go` | 修改 | `Config` 增加 `AdminToken` 字段，`/api/*` 改用 `adminAuthMiddleware` |
 | `internal/api/middleware.go` | 修改 | 新增 `AdminAuthMiddleware`（X-Admin-Token / Basic Auth / ?admin_token=） |
 | `internal/api/admin.go` | 修改 | `/health` 智能返回 503（服务未就绪时） |
-| `Dockerfile` | 新增 | 多阶段构建 + Camoufox 动态版本 + HF 默认环境变量 |
+| `Dockerfile` | 新增 | 四阶段构建（node:24 官方镜像/Go/Camoufox 预下载/runtime），非 root UID 1000 运行 |
+| `.github/workflows/ci.yml` | 新增 | CI: PR 质量门禁（go vet/build + 前端类型检查） |
 | `.github/workflows/docker-publish.yml` | 新增 | CI: 构建镜像推送 GHCR，并通过 workflow_call 链式触发 HF 同步 |
 | `.github/workflows/huggingface-sync.yml` | 新增 | CI: 幂等创建 HF Space（private + Docker SDK）并强推源码，支持手动/链式触发 |
 | `.dockerignore` | 新增 | 排除运行时数据和构建产物 |
