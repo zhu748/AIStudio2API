@@ -26,6 +26,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # workflow 结构校验:拦截"YAML 语法合法但 GitHub schema 非法"的
+      # 错误(如 step 级 uses 调用 reusable workflow、非法键、引用不存在的
+      # step output 等)。此类错误 GitHub 直接拒绝整个 workflow 文件,
+      # run 零 job 秒失败且无日志,本地 YAML 校验完全发现不了。
+      # shellcheck 集成关闭:历史 run 脚本存在风格告警,不在本门禁范围
+      - name: Workflow lint (actionlint)
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color -shellcheck=
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:

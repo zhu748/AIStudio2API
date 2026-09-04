@@ -31,6 +31,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # 传递给链式调用的 HF 同步 job
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
@@ -110,14 +114,18 @@ jobs:
           echo "  ${IMAGE_LC}:latest" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - name: Sync to HuggingFace Space
-        # 复用 huggingface-sync.yml 的 workflow_call 入口
-        # (原先用 benc-uk/workflow-dispatch 触发 workflow_dispatch,
-        #  需要 actions:write 权限,GITHUB_TOKEN 默认没有,会 403 失败;
-        #  reusable workflow 无此问题,且 secrets: inherit 可传递 HF_TOKEN)
-        if: github.ref == 'refs/heads/main' || github.ref_type == 'tag'
-        uses: ./.github/workflows/huggingface-sync.yml
-        with:
-          image_tag: ${{ steps.meta.outputs.version }}
-          digest: ${{ steps.build.outputs.digest }}
-        secrets: inherit
+  # HF 同步: reusable workflow 只能在 JOB 级调用(不能在 step 级 uses),
+  # 否则 GitHub 直接拒绝整个 workflow 文件——run 零 job 秒失败,
+  # 无日志无报错,极难排查(历史踩坑)
+  # (原先用 benc-uk/workflow-dispatch 触发 workflow_dispatch,需要
+  #  actions:write 权限,GITHUB_TOKEN 默认没有,必 403;job 级
+  #  reusable workflow 调用无此问题,secrets: inherit 可传递 HF_TOKEN)
+  sync-hf:
+    name: Sync to HuggingFace Space
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref_type == 'tag'
+    uses: ./.github/workflows/huggingface-sync.yml
+    with:
+      image_tag: ${{ needs.build.outputs.version }}
+      digest: ${{ needs.build.outputs.digest }}
+    secrets: inherit
