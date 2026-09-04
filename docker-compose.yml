@@ -1,0 +1,57 @@
+# AIStudio2API Docker Compose 配置
+#
+# 使用方法:
+#   1. 准备多账号 JSON 文件,执行: gzip -c auth.json | base64 -w0
+#   2. 复制 .env.example 为 .env, 填入 AISTUDIO_AUTH_ACCOUNTS, PROXY_API_KEY, ADMIN_TOKEN
+#   3. 启动: docker compose up -d
+#   4. 访问: http://localhost:7860 (Basic Auth 用户名 = ADMIN_TOKEN, 密码留空)
+#
+# 使用 GHCR 预构建镜像(推荐,无需本地构建):
+#   docker compose up -d
+#
+# 强制本地构建:
+#   docker compose up -d --build
+
+services:
+  aistudio2api:
+    image: ghcr.io/zhu748/aistudio2api:latest
+    # 如需本地构建,注释上面 image 行,取消下面 build 行注释
+    # build: .
+    container_name: aistudio2api
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    environment:
+      # 这些会覆盖 .env 中的同名字段
+      LISTEN_ADDR: 0.0.0.0:7860
+      AISTUDIO_FAILOVER: "true"
+      WARM_WORKER_LIMIT: 1
+      MAX_ACTIVE_WORKERS: 1
+      WARM_STARTUP_CONCURRENCY: 1
+      TEMPORARY_CHAT: "true"
+    volumes:
+      # 持久化 auth 目录(可选,重启后凭证不丢失)
+      - ./data/auth:/app/auth
+      # 持久化 Camoufox profile(可选,加速重启)
+      - ./data/runtime:/app/runtime
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7860/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+# .env 文件示例(复制 .env.example 后修改):
+# AISTUDIO_AUTH_ACCOUNTS=gzip:H4sIAAAAA...
+# PROXY_API_KEY=sk-your-random-secret
+# ADMIN_TOKEN=your-admin-secret
+# AISTUDIO_ACTIVE_EMAIL=youremail@gmail.com
+# PROXY=http://your-residential-proxy:8080

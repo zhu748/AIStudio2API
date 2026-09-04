@@ -1,0 +1,161 @@
+name: Sync to HuggingFace Space
+
+# 一键同步代码到 HuggingFace Spaces Docker 仓库
+# HF Spaces 会自动从 Space 仓库读取 Dockerfile 并构建
+#
+# 必需 Secrets(在 GitHub repo Settings → Secrets and variables → Actions 添加):
+#   - HF_TOKEN: HuggingFace Access Token(需 write 权限)
+# 必需 Variables(在 Settings → Secrets → Variables for Actions 添加):
+#   - HF_SPACE_OWNER: HF 用户名或组织名(例如 your-username)
+#   - HF_SPACE_NAME: Space 名称(默认 aistudio2api)
+#
+# 触发:
+#   - docker-publish 工作流完成后自动调用
+#   - 手动触发(workflow_dispatch)
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: '关联的 Docker 镜像 tag(用于记录)'
+        required: false
+        default: ''
+      digest:
+        description: 'Docker 镜像 digest(用于记录)'
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      image_tag:
+        type: string
+        required: false
+        default: ''
+      digest:
+        type: string
+        required: false
+        default: ''
+
+env:
+  HF_SPACE_REPO: ${{ vars.HF_SPACE_OWNER }}/aistudio2api
+
+jobs:
+  sync:
+    name: Sync to HuggingFace Space
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check HF credentials
+        id: check
+        run: |
+          if [ -z "${{ secrets.HF_TOKEN }}" ]; then
+            echo "::warning::HF_TOKEN secret 未设置,跳过 HF 同步"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          elif [ -z "${{ vars.HF_SPACE_OWNER }}" ]; then
+            echo "::warning::HF_SPACE_OWNER variable 未设置,跳过 HF 同步"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Will sync to https://huggingface.co/spaces/${{ vars.HF_SPACE_OWNER }}/aistudio2api"
+          fi
+
+      - name: Checkout source
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Configure git
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Remove git history artifacts
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          # 移除 .git 历史等不需要同步的内容(后续会重新 init)
+          rm -rf .git
+
+      - name: Prepare HF Space metadata
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          # HF Spaces 通过 README.md 顶部的 YAML frontmatter 配置 SDK
+          # 如果没有 frontmatter,创建一个
+          if [ ! -f README.md ] || ! head -1 README.md | grep -q '^---$'; then
+            cat > /tmp/hf_header.md <<'EOF'
+            ---
+            title: AIStudio2API
+            emoji: 🤖
+            colorFrom: blue
+            colorTo: green
+            sdk: docker
+            sdk_version: latest
+            app_port: 7860
+            pinned: false
+            license: mit
+            ---
+            EOF
+            cat /tmp/hf_header.md README.md > README.md.new 2>/dev/null || mv /tmp/hf_header.md README.md.new
+            mv README.md.new README.md
+          else
+            # 已有 frontmatter, 确保 sdk: docker 和 app_port: 7860
+            python3 <<'PY'
+            import re
+            with open('README.md') as f:
+                content = f.read()
+            # 确保 sdk: docker
+            content = re.sub(r'sdk:\s*\w+', 'sdk: docker', content, count=1)
+            # 确保 app_port: 7860
+            if 'app_port:' not in content:
+                content = content.replace('sdk: docker', 'sdk: docker\napp_port: 7860', 1)
+            else:
+                content = re.sub(r'app_port:\s*\d+', 'app_port: 7860', content)
+            with open('README.md', 'w') as f:
+                f.write(content)
+            PY
+          fi
+          echo "=== README.md frontmatter ==="
+          head -20 README.md
+
+      - name: Initialize HF Space repo
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add space "https://user:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/${HF_SPACE_REPO}"
+          git checkout -b main
+
+      - name: Commit and force-push
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git add -A
+          COMMIT_MSG="Sync from GitHub ${{ github.repository }}@${{ github.sha }}"
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            COMMIT_MSG="$COMMIT_MSG (image tag: ${{ inputs.image_tag }})"
+          fi
+          git commit -m "$COMMIT_MSG" || {
+            echo "::warning::没有改动可提交"
+            exit 0
+          }
+          # 强制推送覆盖 HF Space 仓库(以 GitHub 为准)
+          git push -f space main
+
+      - name: Summary
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          echo "## HuggingFace Space Synced" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Space URL:** https://huggingface.co/spaces/${HF_SPACE_REPO}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**App URL:** https://${{ vars.HF_SPACE_OWNER }}-aistudio2api.hf.space" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**关联镜像 tag:** ${{ inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**关联镜像 digest:** ${{ inputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 下一步" >> $GITHUB_STEP_SUMMARY
+          echo "1. 在 Space Settings → Variables and secrets 配置 Secrets:" >> $GITHUB_STEP_SUMMARY
+          echo "   - \`AISTUDIO_AUTH_ACCOUNTS\` (gzip: 前缀的多账号 JSON)" >> $GITHUB_STEP_SUMMARY
+          echo "   - \`PROXY_API_KEY\` (API 调用密钥)" >> $GITHUB_STEP_SUMMARY
+          echo "   - \`ADMIN_TOKEN\` (管理端鉴权)" >> $GITHUB_STEP_SUMMARY
+          echo "2. 等待 Space 自动构建(约 5-10 分钟)" >> $GITHUB_STEP_SUMMARY
+          echo "3. 访问 App URL,用 ADMIN_TOKEN 通过 Basic Auth 登录" >> $GITHUB_STEP_SUMMARY

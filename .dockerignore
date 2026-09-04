@@ -1,0 +1,41 @@
+# 版本控制与 IDE
+.git
+.gitignore
+.github
+.vscode
+.idea
+*.swp
+
+# 构建产物
+dist/
+internal/webui/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+aistudio2api
+aistudio2api.exe
+
+# 依赖目录
+web/node_modules/
+
+# 运行时数据(不应进入镜像)
+auth/
+runtime/
+.leases/
+*.log
+*.tmp
+.env
+.env.local
+.env.*.local
+
+# 文档(镜像不需要)
+README.md
+README_en.md
+README_HF.md
+docs/
+LICENSE
+
+# 操作系统垃圾
+.DS_Store
+Thumbs.db
