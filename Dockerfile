@@ -44,7 +44,8 @@ RUN apt-get update && \
     CAMOUFOX_VERSION=$(grep -oE 'camoufoxRelease = "[^"]+"' /tmp/download.go | head -1 | sed -E 's/.*"([^"]+)".*/\1/') && \
     test -n "$CAMOUFOX_VERSION" && \
     echo "Camoufox version: $CAMOUFOX_VERSION" && \
-    curl -fsSL -o /tmp/camoufox.zip \
+    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --progress-bar \
+      -o /tmp/camoufox.zip \
       "https://github.com/daijro/camoufox/releases/download/v${CAMOUFOX_VERSION}/camoufox-${CAMOUFOX_VERSION}-lin.x86_64.zip" && \
     mkdir -p /camoufox && \
     unzip -q /tmp/camoufox.zip -d /camoufox && \
@@ -55,10 +56,11 @@ RUN apt-get update && \
 # ============================ runtime stage ============================
 FROM ubuntu:22.04 AS runtime
 
-# Firefox/Camoufox 运行时依赖(GTK3, X11, NSS, ALSA, dbus-glib, 字体)
+# Firefox/Camoufox 运行时依赖(GTK3, X11, NSS, ALSA, dbus-glib, 字体, curl for healthcheck)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
+      curl \
       tzdata \
       fonts-liberation fonts-noto-color-emoji \
       libgtk-3-0 libgtk-3-bin \
