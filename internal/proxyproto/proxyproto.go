@@ -311,12 +311,9 @@ func (t linkTransport) dialTransport(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("连接代理服务器 %s 失败: %w", address, err)
 	}
-	if t.network == "ws" {
-		conn, err = handshakeWebSocket(ctx, conn, t)
-		if err != nil {
-			return nil, err
-		}
-	}
+	// 正确的握手顺序: TCP → TLS → WebSocket。
+	// 若先做明文 WS 握手再套 TLS,会把明文 HTTP Upgrade 发到 TLS 端口,
+	// ws+tls 节点(Cloudflare CDN 场景/trojan 默认)将必然失败。
 	if t.tlsEnabled {
 		sni := t.sni
 		if sni == "" {
@@ -327,6 +324,12 @@ func (t linkTransport) dialTransport(ctx context.Context) (net.Conn, error) {
 			hostHeader = t.host
 		}
 		conn, err = upgradeTLS(ctx, conn, sni, hostHeader, t.insecure)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if t.network == "ws" {
+		conn, err = handshakeWebSocket(ctx, conn, t)
 		if err != nil {
 			return nil, err
 		}

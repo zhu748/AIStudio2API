@@ -88,10 +88,14 @@ func minuteQuotaReset(windowStart string, now time.Time) time.Time {
 	return now.Add(time.Minute)
 }
 
+// nextQuotaDay 计算太平洋时区下一个配额日的零点。
+// 时区加载失败时回退到 UTC,绝不 panic——该函数位于请求重试热路径,
+// panic 会直接带崩整个进程。
 func nextQuotaDay(now time.Time) time.Time {
 	location, err := time.LoadLocation(quotaResetTimezone)
 	if err != nil {
-		panic(err)
+		// 理论上不会发生(已嵌入 tzdata),但防御性回退保证服务可用
+		location = time.UTC
 	}
 	local := now.In(location)
 	return time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, location)

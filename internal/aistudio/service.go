@@ -248,13 +248,13 @@ func (p *PoolRequestContextProvider) RequestContext(_ context.Context, accountID
 	if accountID == "" {
 		return RequestContext{}, fmt.Errorf("AI Studio 请求上下文缺少账户 ID")
 	}
-	p.pool.mu.Lock()
+	p.pool.mu.RLock()
 	account := p.pool.byID[accountID]
 	timezone := ""
 	if account != nil {
 		timezone = account.Config.Timezone
 	}
-	p.pool.mu.Unlock()
+	p.pool.mu.RUnlock()
 	if account == nil {
 		return RequestContext{}, fmt.Errorf("账户不存在: %s", accountID)
 	}
@@ -276,8 +276,10 @@ func (s *PooledService) Models(ctx context.Context) ([]Model, error) {
 	models := make([]Model, 0)
 	available := 0
 	failures := make([]error, 0)
+	// 增量合并:多账户循环中避免每轮重复克隆累积集
+	merged := make(map[string]Model)
 	for _, result := range s.refreshModelCatalogs(ctx, targets) {
-		models = mergeModels(models, result.models)
+		mergeModelsInto(merged, result.models)
 		if result.available {
 			available++
 		}
@@ -285,6 +287,7 @@ func (s *PooledService) Models(ctx context.Context) ([]Model, error) {
 			failures = append(failures, result.err)
 		}
 	}
+	models = materializeMergedModels(merged)
 	if ctx.Err() != nil {
 		failures = append(failures, ctx.Err())
 	}
@@ -318,15 +321,16 @@ func (s *PooledService) RefreshAccountModels(ctx context.Context, accountID stri
 
 // CachedModels 返回启用账户最近同步目录的并集
 func (s *PooledService) CachedModels() []Model {
-	s.pool.mu.Lock()
-	defer s.pool.mu.Unlock()
-	models := make([]Model, 0)
+	s.pool.mu.RLock()
+	defer s.pool.mu.RUnlock()
+	// 增量合并:避免每账户一轮重复克隆累积集(此前为 O(A²·M))
+	merged := make(map[string]Model)
 	for _, account := range s.pool.accounts {
 		if account != nil && account.Config.Enabled {
-			models = mergeModels(models, account.Models)
+			mergeModelsInto(merged, account.Models)
 		}
 	}
-	return models
+	return materializeMergedModels(merged)
 }
 
 type accountModelsResult struct {
@@ -387,8 +391,8 @@ func (s *PooledService) modelsForStatus(ctx context.Context, status AccountStatu
 }
 
 func (s *PooledService) cachedModels(accountID string) []Model {
-	s.pool.mu.Lock()
-	defer s.pool.mu.Unlock()
+	s.pool.mu.RLock()
+	defer s.pool.mu.RUnlock()
 	account := s.pool.byID[accountID]
 	if account == nil {
 		return nil
@@ -480,7 +484,10 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 	selection := AccountSelection{ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "countTokens"}
 	var count TokenCount
 	var requestErr error
-	for attempt := 0; attempt < accountAttemptLimit(s.pool, false); attempt++ {
+	// 循环外求值一次:accountAttemptLimit 内部做全池 Status 深拷贝,
+	// 若放在循环条件里每次迭代都会重复求值,高并发下形成分配风暴
+	attemptLimit := accountAttemptLimit(s.pool, false)
+	for attempt := 0; attempt < attemptLimit; attempt++ {
 		lease, owned, err := resolveAccountLease(ctx, s.pool, selection)
 		if err != nil {
 			if requestErr != nil && errors.Is(err, ErrNoEligibleAccount) {
@@ -543,7 +550,9 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 		pinned = true
 	}
 	var requestErr error
-	for attempt := 0; attempt < accountAttemptLimit(s.pool, pinned); attempt++ {
+	// 循环外求值一次:避免每次迭代重复做全池 Status 深拷贝
+	attemptLimit := accountAttemptLimit(s.pool, pinned)
+	for attempt := 0; attempt < attemptLimit; attempt++ {
 		lease, owned, err := resolveAccountLease(ctx, s.pool, selection)
 		if err != nil {
 			if requestErr != nil && errors.Is(err, ErrNoEligibleAccount) {
@@ -658,9 +667,21 @@ func forwardEventsWithLease(
 	}
 }
 
+// mergeModels 将两组模型按 ID 取并集(字段级合并),返回独立的结果切片。
 func mergeModels(base []Model, additions []Model) []Model {
 	merged := make(map[string]Model, len(base)+len(additions))
-	for _, model := range append(cloneModels(base), cloneModels(additions)...) {
+	mergeModelsInto(merged, base)
+	mergeModelsInto(merged, additions)
+	return materializeMergedModels(merged)
+}
+
+// mergeModelsInto 把 additions 逐个并入 merged map。
+// 此前实现每次调用都先 deep clone base+additions,在多账户循环里累积成
+// O(A²·M) 的克隆风暴;现在只在真正发生字段合并时才分配新容器,
+// 且绝不修改任何输入切片/map。
+// 模型首次入 map 时为浅拷贝存储,字段级独立化推迟到 materialize 阶段完成。
+func mergeModelsInto(merged map[string]Model, additions []Model) {
+	for _, model := range additions {
 		current, exists := merged[model.ID]
 		if !exists {
 			merged[model.ID] = model
@@ -675,27 +696,54 @@ func mergeModels(base []Model, additions []Model) []Model {
 		}
 		current.InputTokenLimit = minimumPositive(current.InputTokenLimit, model.InputTokenLimit)
 		current.OutputTokenLimit = minimumPositive(current.OutputTokenLimit, model.OutputTokenLimit)
-		if current.Capabilities == nil && len(model.Capabilities) > 0 {
-			current.Capabilities = make(map[string]bool, len(model.Capabilities))
+		if len(model.Capabilities) > 0 {
+			capabilities := make(map[string]bool, len(current.Capabilities)+len(model.Capabilities))
+			for name, enabled := range current.Capabilities {
+				capabilities[name] = enabled
+			}
+			for name, enabled := range model.Capabilities {
+				capabilities[name] = capabilities[name] || enabled
+			}
+			current.Capabilities = capabilities
 		}
-		for name, enabled := range model.Capabilities {
-			current.Capabilities[name] = current.Capabilities[name] || enabled
-		}
-		if current.CapabilityOptions == nil && len(model.CapabilityOptions) > 0 {
-			current.CapabilityOptions = make(map[string][]string, len(model.CapabilityOptions))
-		}
-		for name, values := range model.CapabilityOptions {
-			current.CapabilityOptions[name] = unionStrings(current.CapabilityOptions[name], values)
+		if len(model.CapabilityOptions) > 0 {
+			options := make(map[string][]string, len(current.CapabilityOptions)+len(model.CapabilityOptions))
+			for name, values := range current.CapabilityOptions {
+				options[name] = values
+			}
+			for name, values := range model.CapabilityOptions {
+				options[name] = unionStrings(options[name], values)
+			}
+			current.CapabilityOptions = options
 		}
 		current.AccessModes = unionInt64(current.AccessModes, model.AccessModes)
 		current.Paid = current.Paid || model.Paid
 		merged[model.ID] = current
 	}
+}
+
+// materializeMergedModels 把合并 map 固化为按 ID 排序的独立切片,
+// 并对可变字段做最终克隆,确保结果不与任何输入共享底层数据。
+func materializeMergedModels(merged map[string]Model) []Model {
 	result := make([]Model, 0, len(merged))
 	for _, model := range merged {
 		model.Methods = unionStrings(nil, model.Methods)
-		for name, values := range model.CapabilityOptions {
-			model.CapabilityOptions[name] = unionStrings(nil, values)
+		if model.AccessModes != nil {
+			model.AccessModes = unionInt64(nil, model.AccessModes)
+		}
+		if model.Capabilities != nil {
+			capabilities := make(map[string]bool, len(model.Capabilities))
+			for name, enabled := range model.Capabilities {
+				capabilities[name] = enabled
+			}
+			model.Capabilities = capabilities
+		}
+		if model.CapabilityOptions != nil {
+			options := make(map[string][]string, len(model.CapabilityOptions))
+			for name, values := range model.CapabilityOptions {
+				options[name] = unionStrings(nil, values)
+			}
+			model.CapabilityOptions = options
 		}
 		result = append(result, model)
 	}

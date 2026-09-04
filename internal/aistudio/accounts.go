@@ -200,14 +200,28 @@ type AccountCandidateState struct {
 	AvailableSlot int
 }
 
+// AccountOverview 表示调度决策所需的最小账户视图。
+// 与 AccountStatus 不同,它不克隆模型列表、冷却表等重负载字段,
+// 供重试/预热/等待等高频路径使用,避免全池深拷贝。
+type AccountOverview struct {
+	ID       string
+	Label    string
+	State    AccountState
+	Enabled  bool
+	LastUsed time.Time
+}
+
 // AccountStore 从一个或多个账户文件或目录加载账户
 type AccountStore struct {
 	paths []string
 }
 
-// AccountPool 在账户之间执行能力与并发槽位调度
+// AccountPool 在账户之间执行能力与并发槽位调度。
+// mu 为读写锁:调度/acquire 等变更路径持有写锁,
+// Status/ClassifyCandidates/Bootstrap* 等只读路径仅持读锁,
+// 避免高频只读扫描(预热循环、重试循环、管理页)阻塞租约获取。
 type AccountPool struct {
-	mu                    sync.Mutex
+	mu                    sync.RWMutex
 	accounts              []*Account
 	byID                  map[string]*Account
 	resources             map[string]string
@@ -637,8 +651,8 @@ func (p *AccountPool) Account(accountID string) (*Account, error) {
 	if p == nil {
 		return nil, ErrAccountNotFound
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	account := p.byID[strings.TrimSpace(accountID)]
 	if account == nil {
 		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
@@ -845,9 +859,9 @@ func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*Ac
 					}
 					return nil, errors.Join(err, releaseErr)
 				}
-				p.mu.Lock()
+				p.mu.RLock()
 				lease.modelAccessGeneration = account.modelAccessGeneration
-				p.mu.Unlock()
+				p.mu.RUnlock()
 				return lease, nil
 			}
 			if !errors.Is(err, errAccountLeaseBusy) {
@@ -1032,8 +1046,9 @@ func (p *AccountPool) refreshAndValidateLease(
 		}
 		lease.refreshRuntime = false
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// 只读校验:仅写租约自身字段,不修改池内账户状态
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	account := lease.account
 	if p.byID[account.ID] != account {
 		return false, ErrNoEligibleAccount
@@ -1179,8 +1194,8 @@ func (p *AccountPool) ModelAccessGeneration(accountID string) uint64 {
 	if p == nil {
 		return 0
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	account := p.byID[strings.TrimSpace(accountID)]
 	if account == nil {
 		return 0
@@ -1691,8 +1706,8 @@ func (p *AccountPool) CandidateStatesForScope(
 	if modelAccessScope == "" {
 		modelAccessScope = modelID
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	for _, accountID := range accountIDs {
 		account := p.byID[accountID]
 		if account == nil {
@@ -1713,7 +1728,7 @@ func (p *AccountPool) PreferWarmPool(accountIDs []string) []string {
 		id       string
 		coverage int
 	}
-	p.mu.Lock()
+	p.mu.RLock()
 	groups := make(map[int][]warmCandidate)
 	for _, accountID := range accountIDs {
 		account := p.byID[accountID]
@@ -1729,7 +1744,7 @@ func (p *AccountPool) PreferWarmPool(accountIDs []string) []string {
 		priority := benefitTierPriority(account.BenefitTier)
 		groups[priority] = append(groups[priority], warmCandidate{id: accountID, coverage: coverage})
 	}
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	priorities := make([]int, 0, len(groups))
 	for priority, candidates := range groups {
 		priorities = append(priorities, priority)
@@ -1955,16 +1970,16 @@ func (p *AccountPool) UnbindResource(resourceID string) error {
 }
 
 func (p *AccountPool) unbindResourceContext(ctx context.Context, resourceID string) error {
-	p.mu.Lock()
+	p.mu.RLock()
 	accountID, exists := p.resources[resourceID]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if !exists {
 		if err := p.refreshResource(ctx, resourceID); err != nil {
 			return err
 		}
-		p.mu.Lock()
+		p.mu.RLock()
 		accountID, exists = p.resources[resourceID]
-		p.mu.Unlock()
+		p.mu.RUnlock()
 	}
 	if !exists {
 		return ErrResourceNotFound
@@ -2002,8 +2017,8 @@ func (p *AccountPool) Status() []AccountStatus {
 	if p == nil {
 		return nil
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	now := time.Now()
 	statuses := make([]AccountStatus, 0, len(p.accounts))
 	for _, account := range p.accounts {
@@ -2061,9 +2076,9 @@ func (p *AccountPool) ClassifyCandidates(
 		}
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		p.mu.Lock()
+		p.mu.RLock()
 		groups, err := p.classifyCandidatesLocked(selection, warmAccountIDs)
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		if err != nil {
 			return AccountCandidateGroups{}, err
 		}
@@ -2249,8 +2264,8 @@ func (p *AccountPool) hasModelCapabilityLocked(modelID string, capability string
 
 // BootstrapModels 返回账户实时目录中的 WAA 初始化模型
 func (p *AccountPool) BootstrapModels(accountID string) ([]string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	account := p.byID[strings.TrimSpace(accountID)]
 	if account == nil {
 		return nil, fmt.Errorf("账户不存在: %s", accountID)
@@ -2264,8 +2279,8 @@ func (p *AccountPool) BootstrapModels(accountID string) ([]string, error) {
 
 // BootstrapModel 返回账户使用的通用 WAA 初始化模型
 func (p *AccountPool) BootstrapModel(accountID string) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	account := p.byID[strings.TrimSpace(accountID)]
 	if account == nil {
 		return "", fmt.Errorf("账户不存在: %s", accountID)
@@ -2277,11 +2292,132 @@ func (p *AccountPool) BootstrapModel(accountID string) (string, error) {
 	return "", fmt.Errorf("账户 %s 的实时目录没有可用 WAA 初始化模型", account.ID)
 }
 
+// AccountOverviews 返回调度决策所需的最小账户视图(单次读锁,零深拷贝)。
+// 重试上限计算、受害者选择、待同步账户收集等高频路径应使用本接口,
+// 而非 Status()(后者每账户克隆+排序模型列表、克隆冷却表)。
+func (p *AccountPool) AccountOverviews() []AccountOverview {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	overviews := make([]AccountOverview, 0, len(p.accounts))
+	for _, account := range p.accounts {
+		if account == nil {
+			continue
+		}
+		// 与 Status() 相同的状态推导(含冷却降级),
+		// 保证调用方按 Ready/Busy 过滤时语义与旧 Status 路径一致
+		state := account.State
+		_, active := accountCooldown(account, "", now)
+		if !account.Config.Enabled {
+			state = AccountDisabled
+		} else if account.exclusive || account.authRefreshers > 0 || account.active > 0 {
+			state = AccountBusy
+		} else if state == AccountReady && active {
+			state = AccountCooldown
+		}
+		overviews = append(overviews, AccountOverview{
+			ID:       account.ID,
+			Label:    account.Config.Label,
+			State:    state,
+			Enabled:  account.Config.Enabled,
+			LastUsed: account.LastUsed,
+		})
+	}
+	return overviews
+}
+
+// BootstrapReadyCount 返回启用且就绪/忙碌并具备 WAA 初始化模型的账户数。
+// 单次读锁完成,PrewarmTarget 不再需要 N+1 次锁获取与 N 次模型列表排序。
+func (p *AccountPool) BootstrapReadyCount() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	available := 0
+	for _, account := range p.accounts {
+		if account == nil || !account.Config.Enabled {
+			continue
+		}
+		if account.State != AccountReady && account.State != AccountBusy {
+			continue
+		}
+		if len(accountBootstrapModels(account)) > 0 {
+			available++
+		}
+	}
+	return available
+}
+
+// BootstrapModelIDs 返回全部启用就绪账户可用的去重 WAA 初始化模型。
+// 单次读锁完成,classifyBootstrapCandidates 不再需要
+// 全池 Status 深拷贝 + 逐账户 BootstrapModels 锁获取。
+func (p *AccountPool) BootstrapModelIDs() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	modelIDs := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, account := range p.accounts {
+		if account == nil || !account.Config.Enabled {
+			continue
+		}
+		if account.State != AccountReady && account.State != AccountBusy {
+			continue
+		}
+		for _, modelID := range accountBootstrapModels(account) {
+			if _, exists := seen[modelID]; exists {
+				continue
+			}
+			seen[modelID] = struct{}{}
+			modelIDs = append(modelIDs, modelID)
+		}
+	}
+	sort.Strings(modelIDs)
+	return modelIDs
+}
+
+// Changed 返回池状态变更广播通道。
+// 每次租约获取/释放、状态迁移、冷却标记都会关闭并重建该通道;
+// 等待账户可用的轮询方应同时监听本通道,实现事件驱动唤醒。
+func (p *AccountPool) Changed() <-chan struct{} {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.changed
+}
+
+// accountBootstrapModels 返回账户可用于 WAA 初始化的模型键(含别名)。
+// 单遍收集资格键集(O(M)),替代原先对每个候选重复扫描全目录的 O(M²);
+// 语义保持一致:modelMatchesID 认可主 ID 与别名,资格判定作用于
+// 被匹配到的实际模型而非查询键本身。
 func accountBootstrapModels(account *Account) []string {
-	models := make([]string, 0, len(account.Models))
-	seen := make(map[string]struct{}, len(account.Models))
+	eligibleKeys := make(map[string]struct{}, len(account.Models))
+	for _, model := range account.Models {
+		if !hasMethod(model, "generateContent") ||
+			!modelAllowedByTier(model, account.BenefitTier) ||
+			!model.Capabilities["chat_model"] {
+			continue
+		}
+		eligibleKeys[model.ID] = struct{}{}
+		for _, alias := range model.CapabilityOptions["aliases"] {
+			eligibleKeys[alias] = struct{}{}
+		}
+	}
+	models := make([]string, 0, len(eligibleKeys))
+	seen := make(map[string]struct{}, len(eligibleKeys))
 	appendModel := func(modelID string) {
-		if _, exists := seen[modelID]; exists || !waaBootstrapModelEligible(account, modelID) {
+		if _, exists := seen[modelID]; exists {
+			return
+		}
+		if _, eligible := eligibleKeys[modelID]; !eligible {
 			return
 		}
 		seen[modelID] = struct{}{}
@@ -2292,17 +2428,6 @@ func accountBootstrapModels(account *Account) []string {
 		appendModel(model.ID)
 	}
 	return models
-}
-
-func waaBootstrapModelEligible(account *Account, modelID string) bool {
-	for _, model := range account.Models {
-		if !modelMatchesID(model, modelID) || !hasMethod(model, "generateContent") ||
-			!modelAllowedByTier(model, account.BenefitTier) || !model.Capabilities["chat_model"] {
-			continue
-		}
-		return true
-	}
-	return false
 }
 
 func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int, error) {
@@ -2704,9 +2829,9 @@ func validatePersistentAccountFiles(account *Account) error {
 func (p *AccountPool) refreshAccountRuntime(ctx context.Context, account *Account) (resultErr error) {
 	account.runtimeMu.Lock()
 	defer account.runtimeMu.Unlock()
-	p.mu.Lock()
+	p.mu.RLock()
 	currentAccount := p.byID[account.ID]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if currentAccount != account {
 		return fmt.Errorf("%w: %s", ErrAccountNotFound, account.ID)
 	}
@@ -2769,11 +2894,11 @@ func (p *AccountPool) refreshAccountRuntimes(ctx context.Context, accounts []*Ac
 
 func (p *AccountPool) refreshResource(ctx context.Context, resourceID string) error {
 	resourceID = strings.TrimSpace(resourceID)
-	p.mu.Lock()
+	p.mu.RLock()
 	ownerID, exists := p.resources[resourceID]
 	owner := p.byID[ownerID]
 	if exists && owner != nil {
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		if err := p.refreshAccountRuntime(ctx, owner); err != nil {
 			if errors.Is(err, ErrAccountNotFound) {
 				p.markStaleAccountUnavailable(owner)
@@ -2784,7 +2909,7 @@ func (p *AccountPool) refreshResource(ctx context.Context, resourceID string) er
 		return nil
 	}
 	accounts := append([]*Account(nil), p.accounts...)
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	var failures []error
 	for _, result := range p.refreshAccountRuntimes(ctx, accounts) {
 		if result.err == nil {
@@ -2796,9 +2921,9 @@ func (p *AccountPool) refreshResource(ctx context.Context, resourceID string) er
 		}
 		failures = append(failures, result.err)
 	}
-	p.mu.Lock()
+	p.mu.RLock()
 	_, found := p.resources[resourceID]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if found {
 		return nil
 	}
@@ -2814,7 +2939,7 @@ func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection Ac
 	}
 	requestedAccountID := strings.TrimSpace(selection.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
-	p.mu.Lock()
+	p.mu.RLock()
 	accounts := make([]*Account, 0, len(p.accounts))
 	for _, account := range p.accounts {
 		if account == nil || !account.Config.Enabled || account.State != AccountReady {
@@ -3071,26 +3196,10 @@ func normalizeAccountEmail(candidate string) (string, error) {
 	return id, nil
 }
 
+// cloneAccountModels 与 cloneModels 语义完全一致(此前是逐行重复的两份实现,
+// 维护时容易改漏一份),统一委托到 cloneModels。
 func cloneAccountModels(models []Model) []Model {
-	result := make([]Model, len(models))
-	for index, model := range models {
-		result[index] = model
-		result[index].Methods = append([]string(nil), model.Methods...)
-		result[index].AccessModes = append([]int64(nil), model.AccessModes...)
-		if model.Capabilities != nil {
-			result[index].Capabilities = make(map[string]bool, len(model.Capabilities))
-			for key, value := range model.Capabilities {
-				result[index].Capabilities[key] = value
-			}
-		}
-		if model.CapabilityOptions != nil {
-			result[index].CapabilityOptions = make(map[string][]string, len(model.CapabilityOptions))
-			for key, value := range model.CapabilityOptions {
-				result[index].CapabilityOptions[key] = append([]string(nil), value...)
-			}
-		}
-	}
-	return result
+	return cloneModels(models)
 }
 
 func canonicalAccountModelID(account *Account, modelID string) string {

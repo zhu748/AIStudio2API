@@ -395,8 +395,8 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 }
 
 func (p *AccountPool) fileUploadAccountIDs() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	available := make([]string, 0, len(p.accounts))
 	busy := make([]string, 0, len(p.accounts))
 	for offset := 0; offset < len(p.accounts); offset++ {
@@ -475,8 +475,8 @@ func (p *AccountPool) FileMetadata(ctx context.Context, fileID string) (FileMeta
 	if err := p.refreshResource(ctx, fileID); err != nil {
 		return FileMetadata{}, err
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	accountID, exists := p.resources[fileID]
 	if !exists {
 		return FileMetadata{}, fmt.Errorf("%w: %s", ErrResourceNotFound, fileID)
@@ -830,8 +830,8 @@ func (p *AccountPool) fileReferenceMetadata(ctx context.Context, fileID string) 
 	if err := p.refreshResource(ctx, fileID); err != nil {
 		return "", FileMetadata{}, err
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	owner, exists := p.resources[fileID]
 	if !exists {
 		return "", FileMetadata{}, &fileReferenceNotFoundError{fileID: fileID}
@@ -1167,8 +1167,8 @@ func (pool *AccountPool) ResourceIDForContents(ctx context.Context, contents []C
 	}
 	resourceID := ""
 	owner := ""
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
 	for _, content := range contents {
 		for _, part := range content.Parts {
 			if part.File == nil {

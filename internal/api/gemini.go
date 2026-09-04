@@ -144,11 +144,11 @@ func (s *server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	data := make([]map[string]any, 0, len(models))
+	data := make([]geminiModelOut, 0, len(models))
 	for _, model := range models {
 		data = append(data, geminiModelObject(model))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": data})
+	writeJSON(w, http.StatusOK, geminiModelsListOut{Models: data})
 }
 
 func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
@@ -169,28 +169,19 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 	writeGeminiError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("model %q is unavailable", modelID))
 }
 
-func geminiModelObject(model aistudio.Model) map[string]any {
-	item := map[string]any{
-		"name":                       "models/" + model.ID,
-		"displayName":                model.Name,
-		"description":                model.Description,
-		"supportedGenerationMethods": model.Methods,
-		"inputTokenLimit":            model.InputTokenLimit,
-		"outputTokenLimit":           model.OutputTokenLimit,
+func geminiModelObject(model aistudio.Model) geminiModelOut {
+	return geminiModelOut{
+		Name:                       "models/" + model.ID,
+		DisplayName:                model.Name,
+		Description:                model.Description,
+		SupportedGenerationMethods: model.Methods,
+		InputTokenLimit:            model.InputTokenLimit,
+		OutputTokenLimit:           model.OutputTokenLimit,
+		Capabilities:               model.Capabilities,
+		CapabilityOptions:          model.CapabilityOptions,
+		AccessModes:                model.AccessModes,
+		Paid:                       model.Paid,
 	}
-	if len(model.Capabilities) > 0 {
-		item["capabilities"] = model.Capabilities
-	}
-	if len(model.CapabilityOptions) > 0 {
-		item["capabilityOptions"] = model.CapabilityOptions
-	}
-	if len(model.AccessModes) > 0 {
-		item["accessModes"] = model.AccessModes
-	}
-	if model.Paid {
-		item["paid"] = true
-	}
-	return item
 }
 
 func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +198,7 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request geminiRequest
-	if err := decodeJSON(r, &request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -699,7 +690,7 @@ func (s *server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request,
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int64{"totalTokens": count.InputTokens})
+	writeJSON(w, http.StatusOK, geminiCountTokensOut{TotalTokens: count.InputTokens})
 }
 
 func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, stream bool) {
@@ -724,201 +715,188 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 	writeJSON(w, http.StatusOK, buildGeminiResponse(request, result))
 }
 
-func buildGeminiResponse(request aistudio.GenerateRequest, result generationResult) map[string]any {
-	candidate := map[string]any{
-		"content": map[string]any{"role": "model", "parts": geminiOutputParts(result)},
-		"index":   0,
+func buildGeminiResponse(request aistudio.GenerateRequest, result generationResult) geminiGenerateResponseOut {
+	candidate := geminiCandidateOut{
+		Content: &geminiContentOut{Role: "model", Parts: geminiOutputParts(result)},
+		Index:   0,
 	}
-	setGeminiFinish(candidate, result.finishReason)
+	setGeminiFinish(&candidate, result.finishReason)
 	if result.grounding != nil {
-		candidate["groundingMetadata"] = geminiGroundingMetadata(*result.grounding)
+		candidate.GroundingMetadata = geminiGroundingMetadata(*result.grounding)
 	} else if len(result.citations) > 0 {
-		candidate["citationMetadata"] = geminiCitationMetadata(result.citations)
+		candidate.CitationMetadata = geminiCitationMetadata(result.citations)
 	}
-	response := map[string]any{
-		"candidates":   []any{candidate},
-		"modelVersion": request.Model,
-		"responseId":   request.ID,
-	}
+	model := request.Model
 	if result.providerModel != "" {
-		response["modelVersion"] = result.providerModel
+		model = result.providerModel
+	}
+	response := geminiGenerateResponseOut{
+		Candidates:   []geminiCandidateOut{candidate},
+		ModelVersion: model,
+		ResponseID:   request.ID,
 	}
 	if result.usage != nil {
-		response["usageMetadata"] = geminiUsage(result.usage)
+		response.UsageMetadata = geminiUsage(result.usage)
 	}
 	return response
 }
 
-func geminiOutputParts(result generationResult) []map[string]any {
-	parts := make([]map[string]any, 0)
+func geminiOutputParts(result generationResult) []geminiPartOut {
+	parts := make([]geminiPartOut, 0)
 	for _, event := range result.events {
 		switch event.Kind {
 		case aistudio.EventText:
 			parts = append(parts, geminiSignedPart(geminiTextPart(event), event.ThoughtSignature))
 		case aistudio.EventReasoning:
-			parts = append(parts, geminiSignedPart(map[string]any{"text": event.Text, "thought": true}, event.ThoughtSignature))
+			text := event.Text
+			parts = append(parts, geminiSignedPart(geminiPartOut{Text: &text, Thought: true}, event.ThoughtSignature))
 		case aistudio.EventToolCall:
 			if event.ToolCall != nil {
 				parts = append(parts, geminiSignedPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature))
 			}
 		case aistudio.EventExecutableCode:
 			if event.ExecutableCode != nil {
-				parts = append(parts, geminiSignedPart(map[string]any{"executableCode": map[string]any{
-					"language": event.ExecutableCode.Language, "code": event.ExecutableCode.Code,
+				parts = append(parts, geminiSignedPart(geminiPartOut{ExecutableCode: &geminiExecutableCodeOut{
+					Language: event.ExecutableCode.Language, Code: event.ExecutableCode.Code,
 				}}, event.ThoughtSignature))
 			}
 		case aistudio.EventCodeExecutionResult:
 			if event.CodeExecutionResult != nil {
-				parts = append(parts, geminiSignedPart(map[string]any{
-					"codeExecutionResult": geminiCodeExecutionResult(*event.CodeExecutionResult),
+				parts = append(parts, geminiSignedPart(geminiPartOut{
+					CodeExecutionResult: geminiCodeExecutionResult(*event.CodeExecutionResult),
 				}, event.ThoughtSignature))
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
 				if len(event.Media.Data) > 0 {
-					parts = append(parts, geminiSignedPart(map[string]any{"inlineData": map[string]any{
-						"mimeType": event.Media.MIME, "data": base64.StdEncoding.EncodeToString(event.Media.Data),
+					parts = append(parts, geminiSignedPart(geminiPartOut{InlineData: &geminiInlineDataOut{
+						MIMEType: event.Media.MIME, Data: base64.StdEncoding.EncodeToString(event.Media.Data),
 					}}, event.ThoughtSignature))
 				} else if event.Media.URL != "" {
-					parts = append(parts, geminiSignedPart(map[string]any{"fileData": map[string]any{
-						"mimeType": event.Media.MIME, "fileUri": event.Media.URL, "displayName": event.Media.Name,
+					parts = append(parts, geminiSignedPart(geminiPartOut{FileData: &geminiFileDataOut{
+						MIMEType: event.Media.MIME, FileURI: event.Media.URL, DisplayName: event.Media.Name,
 					}}, event.ThoughtSignature))
 				}
 			}
 		case aistudio.EventThoughtSignature:
 			if event.ThoughtSignature != "" {
-				parts = append(parts, map[string]any{"thoughtSignature": event.ThoughtSignature})
+				parts = append(parts, geminiPartOut{ThoughtSignature: event.ThoughtSignature})
 			}
 		}
 	}
 	return parts
 }
 
-func geminiTextPart(event aistudio.Event) map[string]any {
-	part := map[string]any{"text": event.Text}
+func geminiTextPart(event aistudio.Event) geminiPartOut {
+	text := event.Text
+	part := geminiPartOut{Text: &text}
 	if event.Transcript == nil {
 		return part
 	}
-	metadata := map[string]any{}
-	if event.Transcript.Speaker != "" {
-		metadata["speaker"] = event.Transcript.Speaker
-	}
+	metadata := &geminiTranscriptionMetaOut{Speaker: event.Transcript.Speaker}
 	if len(event.Transcript.Timestamps) > 0 {
-		timestamps := make([]map[string]any, 0, len(event.Transcript.Timestamps))
+		timestamps := make([]geminiTranscriptRangeOut, 0, len(event.Transcript.Timestamps))
 		for _, timestamp := range event.Transcript.Timestamps {
-			timestamps = append(timestamps, map[string]any{
-				"start": geminiTranscriptDuration(timestamp.Start),
-				"end":   geminiTranscriptDuration(timestamp.End),
+			timestamps = append(timestamps, geminiTranscriptRangeOut{
+				Start: geminiTranscriptDuration(timestamp.Start),
+				End:   geminiTranscriptDuration(timestamp.End),
 			})
 		}
-		metadata["timestamps"] = timestamps
+		metadata.Timestamps = timestamps
 	}
-	part["transcriptionMetadata"] = metadata
+	part.TranscriptionMetadata = metadata
 	return part
 }
-
-func geminiTranscriptDuration(duration aistudio.TranscriptDuration) map[string]int64 {
-	return map[string]int64{"seconds": duration.Seconds, "nanos": duration.Nanos}
+func geminiTranscriptDuration(duration aistudio.TranscriptDuration) geminiTranscriptDurationOut {
+	return geminiTranscriptDurationOut{Seconds: duration.Seconds, Nanos: duration.Nanos}
 }
-
-func geminiFunctionCallPart(call aistudio.FunctionCall) map[string]any {
-	part := map[string]any{"functionCall": map[string]any{
-		"id": call.ID, "name": call.Name, "args": call.Arguments,
+func geminiFunctionCallPart(call aistudio.FunctionCall) geminiPartOut {
+	part := geminiPartOut{FunctionCall: &geminiFunctionCallOut{
+		ID: call.ID, Name: call.Name, Args: call.Arguments,
 	}}
 	if call.ThoughtSignature != "" {
-		part["thoughtSignature"] = call.ThoughtSignature
+		part.ThoughtSignature = call.ThoughtSignature
 	}
 	return part
 }
-
-func geminiSignedPart(part map[string]any, signature string) map[string]any {
+func geminiSignedPart(part geminiPartOut, signature string) geminiPartOut {
 	if signature != "" {
-		part["thoughtSignature"] = signature
+		part.ThoughtSignature = signature
 	}
 	return part
 }
-
-func geminiCodeExecutionResult(result aistudio.CodeExecutionResult) map[string]any {
-	output := map[string]any{"outcome": result.Outcome}
+func geminiCodeExecutionResult(result aistudio.CodeExecutionResult) *geminiCodeExecutionResultOut {
+	output := &geminiCodeExecutionResultOut{Outcome: result.Outcome}
 	if result.Outcome == "OUTCOME_OK" {
-		output["output"] = result.Output
+		output.Output = &result.Output
 	} else {
-		output["error"] = result.Error
+		output.Error = &result.Error
 	}
 	return output
 }
-
-func geminiCitationMetadata(citations []aistudio.Citation) map[string]any {
-	sources := make([]map[string]any, 0, len(citations))
+func geminiCitationMetadata(citations []aistudio.Citation) *geminiCitationMetaOut {
+	sources := make([]geminiCitationSourceOut, 0, len(citations))
 	for _, citation := range citations {
-		sources = append(sources, map[string]any{
-			"uri": citation.URL, "title": citation.Title, "startIndex": citation.Start, "endIndex": citation.End,
+		sources = append(sources, geminiCitationSourceOut{
+			URI: citation.URL, Title: citation.Title, StartIndex: citation.Start, EndIndex: citation.End,
 		})
 	}
-	return map[string]any{"citationSources": sources}
+	return &geminiCitationMetaOut{CitationSources: sources}
 }
-
-func geminiGroundingMetadata(metadata aistudio.GroundingMetadata) map[string]any {
-	output := map[string]any{}
+func geminiGroundingMetadata(metadata aistudio.GroundingMetadata) *geminiGroundingMetaOut {
+	output := &geminiGroundingMetaOut{}
 	if metadata.SearchEntryPoint != nil {
-		entry := map[string]any{}
-		if metadata.SearchEntryPoint.RenderedContent != "" {
-			entry["renderedContent"] = metadata.SearchEntryPoint.RenderedContent
+		output.SearchEntryPoint = &geminiSearchEntryOut{
+			RenderedContent: metadata.SearchEntryPoint.RenderedContent,
+			SDKBlob:         metadata.SearchEntryPoint.SDKBlob,
 		}
-		if metadata.SearchEntryPoint.SDKBlob != "" {
-			entry["sdkBlob"] = metadata.SearchEntryPoint.SDKBlob
-		}
-		output["searchEntryPoint"] = entry
 	}
 	if len(metadata.Chunks) > 0 {
-		chunks := make([]map[string]any, 0, len(metadata.Chunks))
+		chunks := make([]geminiGroundingChunkOut, 0, len(metadata.Chunks))
 		for _, chunk := range metadata.Chunks {
-			value := map[string]any{"uri": chunk.URI, "title": chunk.Title}
 			switch chunk.Source {
 			case "web":
-				chunks = append(chunks, map[string]any{"web": value})
+				chunks = append(chunks, geminiGroundingChunkOut{Web: &geminiChunkWebOut{URI: chunk.URI, Title: chunk.Title}})
 			case "retrieved_context":
-				value["text"] = chunk.Text
-				chunks = append(chunks, map[string]any{"retrievedContext": value})
+				chunks = append(chunks, geminiGroundingChunkOut{RetrievedContext: &geminiChunkRetrievedOut{
+					URI: chunk.URI, Title: chunk.Title, Text: chunk.Text,
+				}})
 			case "maps":
-				value["text"] = chunk.Text
-				value["placeId"] = chunk.PlaceID
-				chunks = append(chunks, map[string]any{"maps": value})
+				chunks = append(chunks, geminiGroundingChunkOut{Maps: &geminiChunkMapsOut{
+					URI: chunk.URI, Title: chunk.Title, Text: chunk.Text, PlaceID: chunk.PlaceID,
+				}})
 			}
 		}
-		output["groundingChunks"] = chunks
+		output.GroundingChunks = chunks
 	}
 	if len(metadata.Supports) > 0 {
-		supports := make([]map[string]any, 0, len(metadata.Supports))
+		supports := make([]geminiGroundingSupportOut, 0, len(metadata.Supports))
 		for _, support := range metadata.Supports {
-			value := map[string]any{
-				"segment": map[string]any{
-					"partIndex": support.Segment.PartIndex, "startIndex": support.Segment.StartIndex,
-					"endIndex": support.Segment.EndIndex, "text": support.Segment.Text,
+			item := geminiGroundingSupportOut{
+				Segment: geminiSegmentOut{
+					PartIndex: support.Segment.PartIndex, StartIndex: support.Segment.StartIndex,
+					EndIndex: support.Segment.EndIndex, Text: support.Segment.Text,
 				},
-				"groundingChunkIndices": support.ChunkIndices,
+				GroundingChunkIndices: support.ChunkIndices,
 			}
 			if len(support.ConfidenceScores) > 0 {
-				value["confidenceScores"] = support.ConfidenceScores
+				item.ConfidenceScores = support.ConfidenceScores
 			}
-			supports = append(supports, value)
+			supports = append(supports, item)
 		}
-		output["groundingSupports"] = supports
+		output.GroundingSupports = supports
 	}
 	if metadata.DynamicRetrievalScore != nil {
-		output["retrievalMetadata"] = map[string]any{
-			"googleSearchDynamicRetrievalScore": *metadata.DynamicRetrievalScore,
+		output.RetrievalMetadata = &geminiRetrievalMetaOut{
+			GoogleSearchDynamicRetrievalScore: *metadata.DynamicRetrievalScore,
 		}
 	}
-	if len(metadata.WebSearchQueries) > 0 {
-		output["webSearchQueries"] = metadata.WebSearchQueries
-	}
+	output.WebSearchQueries = metadata.WebSearchQueries
 	if metadata.MapsWidgetContextToken != "" {
-		output["googleMapsWidgetContextToken"] = metadata.MapsWidgetContextToken
+		output.GoogleMapsWidgetContextToken = metadata.MapsWidgetContextToken
 	}
 	return output
 }
-
 func geminiFinishReason(reason string) string {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
 	case "", "stop", "stop_sequence":
@@ -964,92 +942,91 @@ func geminiFinishReason(reason string) string {
 	}
 }
 
-func setGeminiFinish(candidate map[string]any, reason string) {
-	candidate["finishReason"] = geminiFinishReason(reason)
+func setGeminiFinish(candidate *geminiCandidateOut, reason string) {
+	candidate.FinishReason = geminiFinishReason(reason)
 	normalized := strings.ToLower(strings.TrimSpace(reason))
 	if normalized == "missing_thought_signature" {
-		candidate["finishMessage"] = "Missing thought signature"
+		candidate.FinishMessage = "Missing thought signature"
 	} else if strings.HasPrefix(normalized, "provider_") {
-		candidate["finishMessage"] = "AI Studio finish reason " + strings.TrimPrefix(normalized, "provider_")
+		candidate.FinishMessage = "AI Studio finish reason " + strings.TrimPrefix(normalized, "provider_")
 	}
 }
-
-func geminiUsage(usage *aistudio.Usage) map[string]any {
-	return map[string]any{
-		"promptTokenCount":        usage.InputTokens,
-		"candidatesTokenCount":    usage.OutputTokens,
-		"thoughtsTokenCount":      usage.ReasoningTokens,
-		"toolUsePromptTokenCount": usage.ToolTokens,
-		"totalTokenCount":         usage.TotalTokens,
+func geminiUsage(usage *aistudio.Usage) *geminiUsageMetadataOut {
+	return &geminiUsageMetadataOut{
+		PromptTokenCount:        usage.InputTokens,
+		CandidatesTokenCount:    usage.OutputTokens,
+		ThoughtsTokenCount:      usage.ReasoningTokens,
+		ToolUsePromptTokenCount: usage.ToolTokens,
+		TotalTokenCount:         usage.TotalTokens,
 	}
 }
-
 func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, events <-chan aistudio.Event) {
 	streamHeaders(w)
 	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
-		response := map[string]any{"responseId": request.ID, "modelVersion": request.Model}
+		response := geminiStreamChunkOut{ResponseID: request.ID, ModelVersion: request.Model}
 		switch event.Kind {
 		case aistudio.EventText:
-			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(geminiTextPart(event), event.ThoughtSignature))}
+			response.Candidates = []geminiCandidateOut{geminiStreamCandidate(geminiSignedPart(geminiTextPart(event), event.ThoughtSignature))}
 		case aistudio.EventReasoning:
-			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(map[string]any{"text": event.Text, "thought": true}, event.ThoughtSignature))}
+			text := event.Text
+			response.Candidates = []geminiCandidateOut{geminiStreamCandidate(geminiSignedPart(geminiPartOut{Text: &text, Thought: true}, event.ThoughtSignature))}
 		case aistudio.EventToolCall:
 			if event.ToolCall == nil {
 				return nil
 			}
-			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature))}
+			response.Candidates = []geminiCandidateOut{geminiStreamCandidate(geminiSignedPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature))}
 		case aistudio.EventExecutableCode:
 			if event.ExecutableCode == nil {
 				return nil
 			}
-			part := map[string]any{"executableCode": map[string]any{
-				"language": event.ExecutableCode.Language, "code": event.ExecutableCode.Code,
+			part := geminiPartOut{ExecutableCode: &geminiExecutableCodeOut{
+				Language: event.ExecutableCode.Language, Code: event.ExecutableCode.Code,
 			}}
-			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(part, event.ThoughtSignature))}
+			response.Candidates = []geminiCandidateOut{geminiStreamCandidate(geminiSignedPart(part, event.ThoughtSignature))}
 		case aistudio.EventCodeExecutionResult:
 			if event.CodeExecutionResult == nil {
 				return nil
 			}
-			part := map[string]any{
-				"codeExecutionResult": geminiCodeExecutionResult(*event.CodeExecutionResult),
+			part := geminiPartOut{
+				CodeExecutionResult: geminiCodeExecutionResult(*event.CodeExecutionResult),
 			}
-			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(part, event.ThoughtSignature))}
+			response.Candidates = []geminiCandidateOut{geminiStreamCandidate(geminiSignedPart(part, event.ThoughtSignature))}
 		case aistudio.EventGrounding:
 			if event.Grounding == nil {
 				return nil
 			}
-			response["candidates"] = []any{map[string]any{
-				"index": 0, "groundingMetadata": geminiGroundingMetadata(*event.Grounding),
+			response.Candidates = []geminiCandidateOut{{
+				Index: 0, GroundingMetadata: geminiGroundingMetadata(*event.Grounding),
 			}}
 		case aistudio.EventCitation:
 			if event.Citation == nil {
 				return nil
 			}
-			response["candidates"] = []any{map[string]any{
-				"index": 0, "citationMetadata": geminiCitationMetadata([]aistudio.Citation{*event.Citation}),
+			response.Candidates = []geminiCandidateOut{{
+				Index: 0, CitationMetadata: geminiCitationMetadata([]aistudio.Citation{*event.Citation}),
 			}}
 		case aistudio.EventMedia:
 			if event.Media == nil {
 				return nil
 			}
-			var part map[string]any
+			var part geminiPartOut
 			if len(event.Media.Data) > 0 {
-				part = map[string]any{"inlineData": map[string]any{
-					"mimeType": event.Media.MIME, "data": base64.StdEncoding.EncodeToString(event.Media.Data),
+				part = geminiPartOut{InlineData: &geminiInlineDataOut{
+					MIMEType: event.Media.MIME, Data: base64.StdEncoding.EncodeToString(event.Media.Data),
 				}}
 			} else if event.Media.URL != "" {
-				part = map[string]any{"fileData": map[string]any{
-					"mimeType": event.Media.MIME, "fileUri": event.Media.URL, "displayName": event.Media.Name,
+				part = geminiPartOut{FileData: &geminiFileDataOut{
+					MIMEType: event.Media.MIME, FileURI: event.Media.URL, DisplayName: event.Media.Name,
 				}}
 			} else {
 				return nil
 			}
-			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(part, event.ThoughtSignature))}
+			response.Candidates = []geminiCandidateOut{geminiStreamCandidate(geminiSignedPart(part, event.ThoughtSignature))}
 		case aistudio.EventThoughtSignature:
 			if event.ThoughtSignature == "" {
 				return nil
 			}
-			response["candidates"] = []any{geminiStreamCandidate(map[string]any{"thoughtSignature": event.ThoughtSignature})}
+			response.Candidates = []geminiCandidateOut{geminiStreamCandidate(geminiPartOut{ThoughtSignature: event.ThoughtSignature})}
 		default:
 			return nil
 		}
@@ -1057,8 +1034,8 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 	}, func() error { return writeSSEHeartbeat(w) })
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			_ = writeSSE(w, "", map[string]any{"error": map[string]any{
-				"code": statusFromError(err), "message": err.Error(), "status": geminiErrorStatus(err),
+			_ = writeSSE(w, "", geminiStreamErrorOut{Error: geminiErrorInfoOut{
+				Code: statusFromError(err), Message: err.Error(), Status: geminiErrorStatus(err),
 			}})
 		}
 		return
@@ -1067,18 +1044,16 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 	if result.providerModel != "" {
 		model = result.providerModel
 	}
-	candidate := map[string]any{"index": 0}
-	setGeminiFinish(candidate, result.finishReason)
-	final := map[string]any{
-		"responseId": request.ID, "modelVersion": model,
-		"candidates": []any{candidate},
+	final := geminiStreamChunkOut{
+		ResponseID: request.ID, ModelVersion: model,
+		Candidates: []geminiCandidateOut{{Index: 0}},
 	}
+	setGeminiFinish(&final.Candidates[0], result.finishReason)
 	if result.usage != nil {
-		final["usageMetadata"] = geminiUsage(result.usage)
+		final.UsageMetadata = geminiUsage(result.usage)
 	}
 	_ = writeSSE(w, "", final)
 }
-
-func geminiStreamCandidate(part map[string]any) map[string]any {
-	return map[string]any{"index": 0, "content": map[string]any{"role": "model", "parts": []any{part}}}
+func geminiStreamCandidate(part geminiPartOut) geminiCandidateOut {
+	return geminiCandidateOut{Index: 0, Content: &geminiContentOut{Role: "model", Parts: []geminiPartOut{part}}}
 }

@@ -190,7 +190,8 @@ func validateRPCResponse(method string, response *RPCResponse) (*RPCResponse, er
 	}
 	if response.StatusCode != http.StatusOK {
 		defer response.Body.Close()
-		raw, readErr := io.ReadAll(response.Body)
+		// 错误响应体设置上限,防止异常的上游错误页无界读入
+		raw, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		if readErr != nil {
 			return nil, fmt.Errorf("读取 AI Studio %s 错误响应: %w", method, readErr)
 		}

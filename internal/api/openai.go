@@ -86,39 +86,30 @@ func (s *server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicModels(w, models)
 		return
 	}
-	data := make([]map[string]any, 0, len(models))
+	data := make([]openAIModelOut, 0, len(models))
 	for _, model := range models {
-		item := map[string]any{
-			"id":                           model.ID,
-			"object":                       "model",
-			"created":                      0,
-			"owned_by":                     "google",
-			"name":                         model.Name,
-			"description":                  model.Description,
-			"supported_generation_methods": model.Methods,
-			"input_token_limit":            model.InputTokenLimit,
-			"output_token_limit":           model.OutputTokenLimit,
-		}
-		if len(model.Capabilities) > 0 {
-			item["capabilities"] = model.Capabilities
-		}
-		if len(model.CapabilityOptions) > 0 {
-			item["capability_options"] = model.CapabilityOptions
-		}
-		if len(model.AccessModes) > 0 {
-			item["access_modes"] = model.AccessModes
-		}
-		if model.Paid {
-			item["paid"] = true
-		}
-		data = append(data, item)
+		data = append(data, openAIModelOut{
+			ID:                         model.ID,
+			Object:                     "model",
+			Created:                    0,
+			OwnedBy:                    "google",
+			Name:                       model.Name,
+			Description:                model.Description,
+			SupportedGenerationMethods: model.Methods,
+			InputTokenLimit:            model.InputTokenLimit,
+			OutputTokenLimit:           model.OutputTokenLimit,
+			Capabilities:               model.Capabilities,
+			CapabilityOptions:          model.CapabilityOptions,
+			AccessModes:                model.AccessModes,
+			Paid:                       model.Paid,
+		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	writeJSON(w, http.StatusOK, openAIModelsListOut{Object: "list", Data: data})
 }
 
 func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var request chatRequest
-	if err := decodeJSON(r, &request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -597,82 +588,90 @@ func normalizeStopSequences(values []string) []string {
 	return normalized
 }
 
-func buildChatCompletion(id string, created int64, model string, result generationResult) map[string]any {
+func buildChatCompletion(id string, created int64, model string, result generationResult) openAICompletionOut {
 	rendered := renderedContent(result.events)
-	content := any(rendered)
-	if rendered == "" && len(result.toolCalls) > 0 {
-		content = nil
+	message := openAIMessageOut{Role: "assistant"}
+	if rendered != "" || len(result.toolCalls) == 0 {
+		message.Content = &rendered
 	}
-	message := map[string]any{"role": "assistant", "content": content}
 	if result.reasoning.Len() > 0 {
-		message["reasoning_content"] = result.reasoning.String()
+		message.ReasoningContent = result.reasoning.String()
 	}
 	if len(result.toolCalls) > 0 {
-		message["tool_calls"] = openAIToolCallOutput(result.toolCalls)
+		message.ToolCalls = openAIToolCallOutput(result.toolCalls)
 	}
 	if len(result.citations) > 0 {
-		message["annotations"] = openAICitations(result.citations)
+		message.Annotations = openAICitations(result.citations)
 	}
-	choice := map[string]any{
-		"index":         0,
-		"message":       message,
-		"finish_reason": openAIFinishReason(result.finishReason, len(result.toolCalls) > 0),
+	response := openAICompletionOut{
+		ID:      id,
+		Object:  "chat.completion",
+		Created: created,
+		Model:   model,
+		Choices: []openAIChoiceMessageOut{{
+			Index:        0,
+			Message:      message,
+			FinishReason: openAIFinishReason(result.finishReason, len(result.toolCalls) > 0),
+		}},
 	}
 	if providerReason := providerFinishReason(result.finishReason); providerReason != "" {
-		choice["provider_finish_reason"] = providerReason
-	}
-	response := map[string]any{
-		"id":      id,
-		"object":  "chat.completion",
-		"created": created,
-		"model":   model,
-		"choices": []any{choice},
+		response.Choices[0].ProviderFinishReason = providerReason
 	}
 	if result.providerModel != "" {
-		response["provider_model"] = result.providerModel
+		response.ProviderModel = result.providerModel
 	}
 	if result.usage != nil {
-		response["usage"] = openAIUsage(result.usage)
+		response.Usage = &openAIUsageOut{
+			PromptTokens:     inputTokens(result.usage),
+			CompletionTokens: outputTokens(result.usage),
+			TotalTokens:      result.usage.TotalTokens,
+			CompletionTokensDetails: openAICompletionDetailOut{
+				ReasoningTokens: result.usage.ReasoningTokens,
+			},
+		}
 	}
 	return response
 }
 
 func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, request chatRequest, id string, created int64, events <-chan aistudio.Event) {
 	streamHeaders(w)
-	if err := writeChatChunk(w, id, created, request.Model, map[string]any{"role": "assistant", "content": ""}, nil, request.StreamOptions.IncludeUsage); err != nil {
+	roleDelta := openAIDeltaOut{Role: "assistant"}
+	emptyContent := ""
+	roleDelta.Content = &emptyContent
+	if err := writeChatChunk(w, id, created, request.Model, roleDelta, nil, request.StreamOptions.IncludeUsage, ""); err != nil {
 		return
 	}
 	toolIndex := 0
 	hasContent := false
 	contentEndsWithNewline := false
+	includeUsage := request.StreamOptions.IncludeUsage
 	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
 		switch event.Kind {
 		case aistudio.EventText:
 			hasContent = hasContent || event.Text != ""
 			contentEndsWithNewline = strings.HasSuffix(event.Text, "\n")
-			return writeChatChunk(w, id, created, request.Model, map[string]any{"content": event.Text}, nil, request.StreamOptions.IncludeUsage)
+			text := event.Text
+			return writeChatChunk(w, id, created, request.Model, openAIDeltaOut{Content: &text}, nil, includeUsage, "")
 		case aistudio.EventReasoning:
-			return writeChatChunk(w, id, created, request.Model, map[string]any{"reasoning_content": event.Text}, nil, request.StreamOptions.IncludeUsage)
+			reasoning := event.Text
+			return writeChatChunk(w, id, created, request.Model, openAIDeltaOut{ReasoningContent: &reasoning}, nil, includeUsage, "")
 		case aistudio.EventToolCall:
 			if event.ToolCall == nil {
 				return nil
 			}
 			call := event.ToolCall
-			toolCall := map[string]any{
-				"index": toolIndex,
-				"id":    call.ID,
-				"type":  "function",
-				"function": map[string]any{
-					"name":      call.Name,
-					"arguments": string(call.Arguments),
-				},
+			toolCall := openAIToolCallChunkOut{
+				Index:    toolIndex,
+				ID:       call.ID,
+				Type:     "function",
+				Function: openAIToolFunctionOut{Name: call.Name, Arguments: string(call.Arguments)},
 			}
 			if call.ThoughtSignature != "" {
-				toolCall["extra_content"] = openAIGoogleThoughtSignature(call.ThoughtSignature)
+				toolCall.ExtraContent = openAIGoogleThoughtSignature(call.ThoughtSignature)
 			}
-			delta := map[string]any{"tool_calls": []any{toolCall}}
+			delta := openAIDeltaOut{ToolCalls: []openAIToolCallChunkOut{toolCall}}
 			toolIndex++
-			return writeChatChunk(w, id, created, request.Model, delta, nil, request.StreamOptions.IncludeUsage)
+			return writeChatChunk(w, id, created, request.Model, delta, nil, includeUsage, "")
 		case aistudio.EventMedia:
 			if event.Media == nil {
 				return nil
@@ -683,7 +682,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 			}
 			hasContent = true
 			contentEndsWithNewline = false
-			return writeChatChunk(w, id, created, request.Model, map[string]any{"content": content}, nil, request.StreamOptions.IncludeUsage)
+			return writeChatChunk(w, id, created, request.Model, openAIDeltaOut{Content: &content}, nil, includeUsage, "")
 		case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 			content := renderCodeExecution(event)
 			if content == "" {
@@ -695,7 +694,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 			content += "\n"
 			hasContent = true
 			contentEndsWithNewline = true
-			return writeChatChunk(w, id, created, request.Model, map[string]any{"content": content}, nil, request.StreamOptions.IncludeUsage)
+			return writeChatChunk(w, id, created, request.Model, openAIDeltaOut{Content: &content}, nil, includeUsage, "")
 		}
 		return nil
 	}, func() error { return writeSSEHeartbeat(w) })
@@ -703,33 +702,28 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 		if shouldWriteRequestError(r, err) {
 			status := statusFromError(err)
 			code := openAIErrorCode(err)
-			_ = writeSSE(w, "", map[string]any{"error": map[string]any{
-				"message": err.Error(),
-				"type":    openAIErrorType(status, code),
-				"code":    code,
+			_ = writeSSE(w, "", openAIStreamErrorOut{Error: openAIErrorBodyOut{
+				Message: err.Error(), Type: openAIErrorType(status, code), Code: code,
 			}})
 		}
 		return
 	}
 	if len(result.citations) > 0 {
-		_ = writeChatChunk(w, id, created, request.Model, map[string]any{"annotations": openAICitations(result.citations)}, nil, request.StreamOptions.IncludeUsage)
+		_ = writeChatChunk(w, id, created, request.Model, openAIDeltaOut{Annotations: openAICitations(result.citations)}, nil, includeUsage, "")
 	}
 	finish := openAIFinishReason(result.finishReason, len(result.toolCalls) > 0)
-	finalDelta := map[string]any{}
-	if providerReason := providerFinishReason(result.finishReason); providerReason != "" {
-		finalDelta["provider_finish_reason"] = providerReason
-	}
-	if err := writeChatChunk(w, id, created, request.Model, finalDelta, &finish, request.StreamOptions.IncludeUsage); err != nil {
+	providerReason := providerFinishReason(result.finishReason)
+	if err := writeChatChunk(w, id, created, request.Model, openAIDeltaOut{}, &finish, includeUsage, providerReason); err != nil {
 		return
 	}
-	if request.StreamOptions.IncludeUsage && result.usage != nil {
-		chunk := map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   request.Model,
-			"choices": []any{},
-			"usage":   openAIUsage(result.usage),
+	if includeUsage && result.usage != nil {
+		chunk := openAIUsageChunkOut{
+			ID:      id,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   request.Model,
+			Choices: []openAIChoiceChunkOut{},
+			Usage:   openAIUsage(result.usage),
 		}
 		if err := writeSSE(w, "", chunk); err != nil {
 			return
@@ -738,25 +732,22 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 	_ = writeSSEText(w, "[DONE]")
 }
 
-func writeChatChunk(w http.ResponseWriter, id string, created int64, model string, delta map[string]any, finish *string, includeUsage bool) error {
-	choice := map[string]any{
-		"index":         0,
-		"delta":         delta,
-		"finish_reason": finish,
-	}
-	if providerReason, ok := delta["provider_finish_reason"].(string); ok && providerReason != "" {
-		delete(delta, "provider_finish_reason")
-		choice["provider_finish_reason"] = providerReason
-	}
-	chunk := map[string]any{
-		"id":      id,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   model,
-		"choices": []any{choice},
+func writeChatChunk(w http.ResponseWriter, id string, created int64, model string, delta openAIDeltaOut, finish *string, includeUsage bool, providerReason string) error {
+	chunk := openAIChunkOut{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   model,
+		Choices: []openAIChoiceChunkOut{{
+			Index:                0,
+			Delta:                delta,
+			FinishReason:         finish,
+			ProviderFinishReason: providerReason,
+		}},
 	}
 	if includeUsage {
-		chunk["usage"] = nil
+		// typed-nil 接口:不被 omitempty 折叠,序列化为 "usage":null
+		chunk.Usage = (*openAIUsageOut)(nil)
 	}
 	return writeSSE(w, "", chunk)
 }
@@ -777,80 +768,89 @@ func openAIFinishReason(reason string, hasTools bool) string {
 	}
 }
 
-func openAIToolCallOutput(calls []aistudio.FunctionCall) []map[string]any {
-	output := make([]map[string]any, 0, len(calls))
+func openAIToolCallOutput(calls []aistudio.FunctionCall) []openAIToolCallOut {
+	output := make([]openAIToolCallOut, 0, len(calls))
 	for _, call := range calls {
-		item := map[string]any{
-			"id":   call.ID,
-			"type": "function",
-			"function": map[string]any{
-				"name":      call.Name,
-				"arguments": string(call.Arguments),
-			},
+		item := openAIToolCallOut{
+			ID:       call.ID,
+			Type:     "function",
+			Function: openAIToolFunctionOut{Name: call.Name, Arguments: string(call.Arguments)},
 		}
 		if call.ThoughtSignature != "" {
-			item["extra_content"] = openAIGoogleThoughtSignature(call.ThoughtSignature)
+			item.ExtraContent = openAIGoogleThoughtSignature(call.ThoughtSignature)
 		}
 		output = append(output, item)
 	}
 	return output
 }
 
-func openAIGoogleThoughtSignature(signature string) map[string]any {
-	return map[string]any{"google": map[string]string{"thought_signature": signature}}
+func openAIGoogleThoughtSignature(signature string) *openAISignatureExtraOut {
+	return &openAISignatureExtraOut{Google: openAIGoogleSignatureOut{ThoughtSignature: signature}}
 }
 
-func openAICitations(citations []aistudio.Citation) []map[string]any {
-	output := make([]map[string]any, 0, len(citations))
+func openAICitations(citations []aistudio.Citation) []openAIAnnotationOut {
+	output := make([]openAIAnnotationOut, 0, len(citations))
 	for _, citation := range citations {
-		output = append(output, map[string]any{
-			"type": "url_citation",
-			"url_citation": map[string]any{
-				"start_index": citation.Start,
-				"end_index":   citation.End,
-				"title":       citation.Title,
-				"url":         citation.URL,
+		output = append(output, openAIAnnotationOut{
+			Type: "url_citation",
+			URLCitation: openAIURLCitationOut{
+				StartIndex: citation.Start,
+				EndIndex:   citation.End,
+				Title:      citation.Title,
+				URL:        citation.URL,
 			},
 		})
 	}
 	return output
 }
 
-func openAIUsage(usage *aistudio.Usage) map[string]any {
-	return map[string]any{
-		"prompt_tokens":     inputTokens(usage),
-		"completion_tokens": outputTokens(usage),
-		"total_tokens":      usage.TotalTokens,
-		"completion_tokens_details": map[string]any{
-			"reasoning_tokens": usage.ReasoningTokens,
+func openAIUsage(usage *aistudio.Usage) openAIUsageOut {
+	return openAIUsageOut{
+		PromptTokens:     inputTokens(usage),
+		CompletionTokens: outputTokens(usage),
+		TotalTokens:      usage.TotalTokens,
+		CompletionTokensDetails: openAICompletionDetailOut{
+			ReasoningTokens: usage.ReasoningTokens,
 		},
 	}
 }
 
 func renderedContent(events []aistudio.Event) string {
 	var content strings.Builder
+	// 追踪末字节:此前用 strings.HasSuffix(content.String(), "\n") 判断,
+	// 每次调用都会把整个累积内容拷贝成 string,长文本+多媒体交错时 O(n²)
+	lastByte := byte(0)
+	ensureNewline := func() {
+		if content.Len() > 0 && lastByte != '\n' {
+			content.WriteByte('\n')
+			lastByte = '\n'
+		}
+	}
+	write := func(text string) {
+		content.WriteString(text)
+		if length := len(text); length > 0 {
+			lastByte = text[length-1]
+		}
+	}
 	for _, event := range events {
 		switch event.Kind {
 		case aistudio.EventText:
-			content.WriteString(event.Text)
+			write(event.Text)
 		case aistudio.EventMedia:
 			if event.Media == nil {
 				continue
 			}
-			if content.Len() > 0 && !strings.HasSuffix(content.String(), "\n") {
-				content.WriteByte('\n')
-			}
-			content.WriteString(renderMediaMarkdown(*event.Media))
+			ensureNewline()
+			write(renderMediaMarkdown(*event.Media))
 		case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 			rendered := renderCodeExecution(event)
 			if rendered == "" {
 				continue
 			}
-			if content.Len() > 0 && !strings.HasSuffix(content.String(), "\n") {
-				content.WriteByte('\n')
-			}
-			content.WriteString(rendered)
+			ensureNewline()
+			write(rendered)
 			content.WriteByte('\n')
+			lastByte = '\n'
 		}
 	}
 	return content.String()

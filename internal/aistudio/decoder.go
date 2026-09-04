@@ -43,8 +43,11 @@ func (e *PromptFeedbackError) Unwrap() error {
 }
 
 type sparseJSONReader struct {
-	source        *bufio.Reader
-	pending       []byte
+	source *bufio.Reader
+	// pending 仅在罕见的稀疏插入("null,"/"null]")时使用固定缓冲,
+	// 避免为普通字节分配堆内存
+	pending       [5]byte
+	pendingLength int
 	inString      bool
 	escaped       bool
 	previousToken byte
@@ -57,9 +60,11 @@ func newSparseJSONReader(source io.Reader) io.Reader {
 func (r *sparseJSONReader) Read(destination []byte) (int, error) {
 	written := 0
 	for written < len(destination) {
-		if len(r.pending) > 0 {
-			count := copy(destination[written:], r.pending)
-			r.pending = r.pending[count:]
+		if r.pendingLength > 0 {
+			count := copy(destination[written:], r.pending[:r.pendingLength])
+			r.pendingLength -= count
+			// 剩余插入字节前移(至多 4 字节)
+			copy(r.pending[:], r.pending[count:count+r.pendingLength])
 			written += count
 			continue
 		}
@@ -73,12 +78,23 @@ func (r *sparseJSONReader) Read(destination []byte) (int, error) {
 			}
 			return 0, err
 		}
-		r.pending = r.normalize(value)
+		if insertion, ok := r.normalize(value); ok {
+			// 罕见路径:稀疏数组插入,复制到固定缓冲,零堆分配
+			r.pendingLength = copy(r.pending[:], insertion)
+			continue
+		}
+		// 常见路径:直接写入目标,零分配
+		destination[written] = value
+		written++
 	}
 	return written, nil
 }
 
-func (r *sparseJSONReader) normalize(value byte) []byte {
+// normalize 处理稀疏数组规则。返回 (插入字节, true) 表示需要插入
+// "null,"/"null]" 前缀;(nil, false) 表示字节本身直接透传。
+// 注意:透传路径绝不分配——此前实现每个字节都 make([]byte, 1),
+// 1MB 流式响应即百万次堆分配,GC 压力完全主导解码开销。
+func (r *sparseJSONReader) normalize(value byte) ([]byte, bool) {
 	if r.inString {
 		if r.escaped {
 			r.escaped = false
@@ -87,26 +103,31 @@ func (r *sparseJSONReader) normalize(value byte) []byte {
 		} else if value == '"' {
 			r.inString = false
 		}
-		return []byte{value}
+		return nil, false
 	}
 	if value == '"' {
 		r.inString = true
 		r.previousToken = value
-		return []byte{value}
+		return nil, false
 	}
 	if value == ',' && (r.previousToken == '[' || r.previousToken == ',') {
 		r.previousToken = value
-		return []byte("null,")
+		return sparseNullComma, true
 	}
 	if value == ']' && r.previousToken == ',' {
 		r.previousToken = value
-		return []byte("null]")
+		return sparseNullBracket, true
 	}
 	if !unicode.IsSpace(rune(value)) {
 		r.previousToken = value
 	}
-	return []byte{value}
+	return nil, false
 }
+
+var (
+	sparseNullComma   = []byte("null,")
+	sparseNullBracket = []byte("null]")
+)
 
 func decodeJSONValue(raw []byte) (json.RawMessage, error) {
 	decoder := json.NewDecoder(newSparseJSONReader(bytes.NewReader(raw)))
@@ -151,7 +172,9 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 		if err := decoder.Decode(&raw); err != nil {
 			return &ProtocolEvidenceError{Method: "GenerateContent", Path: fmt.Sprintf("$[0][%d]", index), Detail: err.Error()}
 		}
-		if err := consume(append(json.RawMessage(nil), raw...)); err != nil {
+		// RawMessage.UnmarshalJSON 内部已做拷贝,decoder 每次产出独立分配,
+		// 此处无需再复制一遍
+		if err := consume(raw); err != nil {
 			return err
 		}
 		index++
@@ -188,9 +211,9 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 
 func rawArray(raw json.RawMessage, path string, evidence json.RawMessage) ([]json.RawMessage, error) {
 	var values []json.RawMessage
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&values); err != nil {
+	// 一次性 Unmarshal:流式帧的 RawMessage 均为合法 JSON 值,
+	// 无需 NewDecoder+Reader 的双重分配
+	if err := json.Unmarshal(raw, &values); err != nil {
 		return nil, &ProtocolEvidenceError{Path: path, Detail: "期望数组", Raw: cloneEvidence(raw, evidence)}
 	}
 	return values, nil
@@ -205,13 +228,10 @@ func rawString(raw json.RawMessage, path string, evidence json.RawMessage) (stri
 }
 
 func rawInt64(raw json.RawMessage, path string, evidence json.RawMessage) (int64, error) {
-	var number json.Number
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&number); err != nil {
-		return 0, &ProtocolEvidenceError{Path: path, Detail: "期望整数", Raw: cloneEvidence(raw, evidence)}
-	}
-	value, err := strconv.ParseInt(number.String(), 10, 64)
+	// 合法 JSON 整数字面量可直接 ParseInt;字符串/null/浮点等形态均会被拒。
+	// 相比 json.NewDecoder+UseNumber 每次调用节省 2 次分配与解码器初始化。
+	trimmed := bytes.TrimSpace(raw)
+	value, err := strconv.ParseInt(string(trimmed), 10, 64)
 	if err != nil {
 		return 0, &ProtocolEvidenceError{Path: path, Detail: "期望整数", Raw: cloneEvidence(raw, evidence)}
 	}
@@ -219,13 +239,9 @@ func rawInt64(raw json.RawMessage, path string, evidence json.RawMessage) (int64
 }
 
 func rawFloat64(raw json.RawMessage, path string, evidence json.RawMessage) (float64, error) {
-	var number json.Number
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&number); err != nil {
-		return 0, &ProtocolEvidenceError{Path: path, Detail: "期望数字", Raw: cloneEvidence(raw, evidence)}
-	}
-	value, err := strconv.ParseFloat(number.String(), 64)
+	// 合法 JSON 数字字面量可直接 ParseFloat(含溢出→ErrRange 语义一致)
+	trimmed := bytes.TrimSpace(raw)
+	value, err := strconv.ParseFloat(string(trimmed), 64)
 	if err != nil {
 		return 0, &ProtocolEvidenceError{Path: path, Detail: "期望数字", Raw: cloneEvidence(raw, evidence)}
 	}

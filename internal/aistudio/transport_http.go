@@ -316,8 +316,8 @@ func validateLeaseSelection(lease *AccountLease, selection AccountSelection) err
 	if lease == nil || lease.pool == nil || lease.account == nil {
 		return fmt.Errorf("context 账户租约未初始化")
 	}
-	lease.pool.mu.Lock()
-	defer lease.pool.mu.Unlock()
+	lease.pool.mu.RLock()
+	defer lease.pool.mu.RUnlock()
 	account := lease.Account()
 	if lease.pool.byID[account.ID] != account {
 		return fmt.Errorf("context 租约账户不存在: %s", account.ID)

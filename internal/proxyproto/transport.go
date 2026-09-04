@@ -16,6 +16,33 @@ import (
 	"time"
 )
 
+// protocolHeaderTimeout 协议头/协商阶段的读取超时。
+// 拨号超时只覆盖 TCP/WS/TLS 握手;之后的 VLESS 响应头、SOCKS5 协商等
+// 若无 deadline,失联或恶意服务器会把 goroutine 永久挂住。
+const protocolHeaderTimeout = 30 * time.Second
+
+// readProtocolHeader 在 deadline 与 ctx 双重保护下执行一次协议头读取。
+// 读取完成(或失败)后恢复无 deadline,后续裸流由调用方自行管理。
+func readProtocolHeader(ctx context.Context, conn net.Conn, read func() error) error {
+	deadline := time.Now().Add(protocolHeaderTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	// ctx 取消 → 立刻打断阻塞读
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetReadDeadline(time.Now())
+	})
+	defer stop()
+	err := read()
+	if clearErr := conn.SetReadDeadline(time.Time{}); err == nil {
+		err = clearErr
+	}
+	return err
+}
+
 // upgradeTLS 在已建立的连接上执行 TLS 握手。
 // hostHeader 仅用于 SNI 缺省回退。
 func upgradeTLS(ctx context.Context, conn net.Conn, sni string, hostHeader string, insecure bool) (net.Conn, error) {

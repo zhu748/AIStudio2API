@@ -34,7 +34,7 @@ type openAISpeechRequest struct {
 
 func (s *server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 	var request openAIImageRequest
-	if err := decodeJSON(r, &request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -134,7 +134,7 @@ func openAIImageConfig(size string, quality string) (*aistudio.ImageConfig, erro
 
 func (s *server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 	var request openAISpeechRequest
-	if err := decodeJSON(r, &request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}

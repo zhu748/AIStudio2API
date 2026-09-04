@@ -553,7 +553,11 @@ type workerOccupancy struct {
 	slots      int
 }
 
-// occupiedWorkers 返回仍持有进程或运行锁的账户与容量槽位
+// occupiedWorkers 返回仍持有进程或运行锁的账户与容量槽位。
+// 每账户使用 TryLock 探测:account.mu 在浏览器 RPC(Prepare/SendProtected)、
+// 进程拆除(Close)期间会被长期持有;此处若阻塞等待,将连带阻塞
+// rebalanceMu,进而冻结全部 ensureWorker 调度。
+// TryLock 失败即代表该账户存在进行中的 worker 操作,保守计入占用。
 func (manager *accountWorkerManager) occupiedWorkers() workerOccupancy {
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
@@ -563,28 +567,37 @@ func (manager *accountWorkerManager) occupiedWorkers() workerOccupancy {
 	manager.mu.RUnlock()
 	occupied := workerOccupancy{accountIDs: make([]string, 0, len(accounts))}
 	for _, account := range accounts {
-		account.mu.Lock()
-		if account.worker != nil || account.cleanupWorker != nil || account.runtimeLease != nil || account.cleanupLease != nil {
-			occupied.accountIDs = append(occupied.accountIDs, account.id)
+		if account.mu.TryLock() {
+			if account.worker != nil || account.cleanupWorker != nil || account.runtimeLease != nil || account.cleanupLease != nil {
+				occupied.accountIDs = append(occupied.accountIDs, account.id)
+			}
+			if account.worker != nil {
+				occupied.slots++
+			}
+			if account.cleanupWorker != nil {
+				occupied.slots++
+			}
+			if account.worker == nil && account.cleanupWorker == nil && account.runtimeLease != nil {
+				occupied.slots++
+			}
+			if account.cleanupWorker == nil && account.cleanupLease != nil {
+				occupied.slots++
+			}
+			account.mu.Unlock()
+			continue
 		}
-		if account.worker != nil {
-			occupied.slots++
-		}
-		if account.cleanupWorker != nil {
-			occupied.slots++
-		}
-		if account.worker == nil && account.cleanupWorker == nil && account.runtimeLease != nil {
-			occupied.slots++
-		}
-		if account.cleanupWorker == nil && account.cleanupLease != nil {
-			occupied.slots++
-		}
-		account.mu.Unlock()
+		// 无法立即获取锁:账户正在被其他 goroutine 操作(启动/激活/拆除/RPC),
+		// 保守视为占用一个容量槽位,避免容量超限。
+		occupied.accountIDs = append(occupied.accountIDs, account.id)
+		occupied.slots++
 	}
 	return occupied
 }
 
-// ReadyWarmAccountIDs 返回可生成 proof 的预热账户
+// ReadyWarmAccountIDs 返回可生成 proof 的预热账户。
+// 使用 TryLock 探测每账户状态:account.mu 在浏览器 RPC 期间被长期持有,
+// 阻塞式扫描会把在途请求的 RPC 时延叠加到每个新请求的调度路径上。
+// 无法立即获锁的账户本轮跳过(仅瞬时收窄候选,下轮重扫)。
 func (manager *accountWorkerManager) ReadyWarmAccountIDs() []string {
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
@@ -597,7 +610,9 @@ func (manager *accountWorkerManager) ReadyWarmAccountIDs() []string {
 		if !account.warm.Load() {
 			continue
 		}
-		account.mu.Lock()
+		if !account.mu.TryLock() {
+			continue
+		}
 		worker := account.worker
 		matches := worker != nil
 		if matches {
@@ -627,16 +642,8 @@ func (manager *accountWorkerManager) coldAccounts(accountIDs []string) []string 
 
 // PrewarmTarget 返回当前配置需要预热的账户数
 func (manager *accountWorkerManager) PrewarmTarget() int {
-	available := 0
-	for _, status := range manager.pool.Status() {
-		if !status.Enabled || (status.State != aistudio.AccountReady && status.State != aistudio.AccountBusy) {
-			continue
-		}
-		if models, err := manager.pool.BootstrapModels(status.ID); err == nil && len(models) > 0 {
-			available++
-		}
-	}
-	return min(manager.warmTarget, available)
+	// 单次读锁的轻量统计,替代 Status 深拷贝 + 逐账户 BootstrapModels 的 N+1 次锁获取
+	return min(manager.warmTarget, manager.pool.BootstrapReadyCount())
 }
 
 func (manager *accountWorkerManager) classifyBootstrapCandidates(
@@ -658,21 +665,7 @@ func (manager *accountWorkerManager) classifyBootstrapCandidates(
 			*target = append(*target, value)
 		}
 	}
-	modelIDs := make([]string, 0)
-	seenModels := make(map[string]struct{})
-	for _, status := range manager.pool.Status() {
-		models, err := manager.pool.BootstrapModels(status.ID)
-		if err != nil {
-			continue
-		}
-		for _, modelID := range models {
-			if _, exists := seenModels[modelID]; exists {
-				continue
-			}
-			seenModels[modelID] = struct{}{}
-			modelIDs = append(modelIDs, modelID)
-		}
-	}
+	modelIDs := manager.pool.BootstrapModelIDs()
 	var matched bool
 	for _, modelID := range modelIDs {
 		groups, err := manager.pool.ClassifyCandidates(ctx, aistudio.AccountSelection{
@@ -721,6 +714,12 @@ func (manager *accountWorkerManager) Worker(ctx context.Context, accountID strin
 	return manager.ensureWorker(ctx, accountID, true)
 }
 
+// readyWorker 返回账户当前可用的 preparer。
+// 使用 TryLock:account.mu 在浏览器 RPC(Prepare/SendProtected)期间被
+// 长期持有;此处若阻塞等待(且调用方持有 rebalanceMu),将把单个
+// 慢请求的 RPC 时延放大为全局调度停摆。TryLock 失败表示该账户
+// 存在进行中的 worker 操作,返回“未就绪”令调用方走容量分支,
+// 由 startReservedWorker 在锁外阻塞并复用现有 worker。
 func (manager *accountWorkerManager) readyWorker(accountID string, bootstrapModel string) (aistudio.ProtectedPreparer, bool, error) {
 	manager.mu.RLock()
 	if manager.closed {
@@ -732,7 +731,11 @@ func (manager *accountWorkerManager) readyWorker(accountID string, bootstrapMode
 	if account == nil {
 		return nil, false, fmt.Errorf("账户不存在: %s", accountID)
 	}
-	account.mu.Lock()
+	if !account.mu.TryLock() {
+		// 账户正被其他 goroutine 操作(在途 RPC/启动/激活/拆除),
+		// 无法确认就绪状态;调用方将通过容量分支在锁外等待复用。
+		return nil, false, nil
+	}
 	defer account.mu.Unlock()
 	manager.mu.RLock()
 	active := !manager.closed && manager.accounts[accountID] == account
@@ -936,13 +939,16 @@ func workerStartupProgress(stage camoufoxnative.StartupStage) (int, string) {
 	case camoufoxnative.StartupBootstrappingWAA:
 		return 7, "执行 WAA Bootstrap"
 	}
-	panic(fmt.Sprintf("未知 WAA Worker 启动阶段: %s", stage))
+	// 未知枚举绝不能 panic:该回调运行在浏览器启动 goroutine,
+	// 上游新增阶段枚举时直接带崩整个进程。降级为末步+原文提示。
+	slog.Warn("未识别的 WAA Worker 启动阶段,使用缺省进度", "stage", string(stage))
+	return 7, "启动 WAA Worker: " + string(stage)
 }
 
 func (manager *accountWorkerManager) idleWarmVictim(excludeID string) string {
-	statusByID := make(map[string]aistudio.AccountStatus)
-	for _, status := range manager.pool.Status() {
-		statusByID[status.ID] = status
+	overviewByID := make(map[string]aistudio.AccountOverview)
+	for _, overview := range manager.pool.AccountOverviews() {
+		overviewByID[overview.ID] = overview
 	}
 	warm := manager.WarmAccountIDs()
 	var selected string
@@ -957,23 +963,24 @@ func (manager *accountWorkerManager) idleWarmVictim(excludeID string) string {
 		if account == nil {
 			continue
 		}
-		account.mu.Lock()
+		// TryLock:account.mu 在在途 RPC 期间被长期持有,
+		// 阻塞式探测会(经由调用方的 rebalanceMu)放大为全局停摆;
+		// 无法获锁的账户正被使用,本不具备“空闲受害者”资格,跳过。
+		if !account.mu.TryLock() {
+			continue
+		}
 		cleanupPending := accountWorkerCleanupPending(account)
 		account.mu.Unlock()
 		if cleanupPending {
 			continue
 		}
-		status := statusByID[accountID]
-		if status.State == aistudio.AccountBusy {
+		overview := overviewByID[accountID]
+		if overview.State == aistudio.AccountBusy {
 			continue
 		}
-		lastUsed := time.Time{}
-		if status.LastUsed != nil {
-			lastUsed = *status.LastUsed
-		}
-		if selected == "" || lastUsed.Before(selectedUsed) {
+		if selected == "" || overview.LastUsed.Before(selectedUsed) {
 			selected = accountID
-			selectedUsed = lastUsed
+			selectedUsed = overview.LastUsed
 		}
 	}
 	return selected
@@ -1054,14 +1061,17 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.openings[accountID] = opening
 			manager.rebalanceMu.Unlock()
 			preparer, err := manager.startReservedWorker(ctx, accountID, bootstrapModel)
-			manager.rebalanceMu.Lock()
 			if err == nil {
+				// 激活/丢弃涉及旧 worker 进程拆除(秒级),
+				// 必须在 rebalanceMu 临界区外执行,否则冻结全部并发调度。
+				// 期间 opening 保持登记,其他请求继续在通道上等待而非重复启动。
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					err = errors.Join(ctxErr, discardAccountWorker(preparer))
 				} else {
 					err = activateAccountWorker(preparer)
 				}
 			}
+			manager.rebalanceMu.Lock()
 			delete(manager.openings, accountID)
 			close(opening)
 			warmCount := len(manager.WarmAccountIDs())
@@ -1075,7 +1085,7 @@ func (manager *accountWorkerManager) ensureWorker(
 		}
 		if len(manager.openings) > 0 {
 			manager.rebalanceMu.Unlock()
-			if err := waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
+			if err := manager.waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
 				return nil, err
 			}
 			continue
@@ -1083,7 +1093,7 @@ func (manager *accountWorkerManager) ensureWorker(
 		victim := manager.idleWarmVictim(accountID)
 		if victim == "" {
 			manager.rebalanceMu.Unlock()
-			if err := waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
+			if err := manager.waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
 				return nil, err
 			}
 			continue
@@ -1099,10 +1109,15 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return nil, startErr
 		}
+		// 驱逐-激活循环全部在 rebalanceMu 外执行:
+		// evictIdleWorker → Reset → worker.Close() 是秒级进程拆除,
+		// 原实现持锁执行导致所有并发 ensureWorker 整体停摆。
+		// 容量一致性由已登记的 opening 保证(其他调用方将其计入槽位);
+		// 拆除/激活期间 opening 保持登记,其他请求等待而非重复启动。
 		for {
-			manager.rebalanceMu.Lock()
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				discardErr := discardAccountWorker(pending)
+				manager.rebalanceMu.Lock()
 				delete(manager.openings, accountID)
 				close(opening)
 				manager.rebalanceMu.Unlock()
@@ -1111,6 +1126,7 @@ func (manager *accountWorkerManager) ensureWorker(
 			evicted, evictionErr := manager.evictIdleWorker(ctx, victim)
 			if evictionErr == nil && evicted {
 				activationErr := activateAccountWorker(pending)
+				manager.rebalanceMu.Lock()
 				delete(manager.openings, accountID)
 				close(opening)
 				warmCount := len(manager.WarmAccountIDs())
@@ -1127,17 +1143,17 @@ func (manager *accountWorkerManager) ensureWorker(
 			}
 			if evictionErr != nil || ctx.Err() != nil {
 				discardErr := discardAccountWorker(pending)
+				manager.rebalanceMu.Lock()
 				delete(manager.openings, accountID)
 				close(opening)
 				manager.rebalanceMu.Unlock()
 				return nil, errors.Join(evictionErr, ctx.Err(), discardErr)
 			}
 			victim = manager.idleWarmVictim(accountID)
-			manager.rebalanceMu.Unlock()
 			if victim == "" {
-				if err := waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
-					manager.rebalanceMu.Lock()
+				if err := manager.waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
 					discardErr := discardAccountWorker(pending)
+					manager.rebalanceMu.Lock()
 					delete(manager.openings, accountID)
 					close(opening)
 					manager.rebalanceMu.Unlock()
@@ -1247,7 +1263,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		}
 		if len(tasks) == 0 {
 			if pendingBusy {
-				if err := waitWarmCandidate(ctx, 100*time.Millisecond); err != nil && !notified {
+				if err := manager.waitWarmCandidate(ctx, 100*time.Millisecond); err != nil && !notified {
 					notify(errors.Join(append(failures, err)...))
 				}
 				continue
@@ -1293,6 +1309,19 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 type warmResult struct {
 	accountID string
 	err       error
+}
+
+// waitWarmCandidate 等待池状态变更或定时器到期(事件驱动的轮询间隔替代)。
+func (manager *accountWorkerManager) waitWarmCandidate(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-manager.pool.Changed():
+	case <-timer.C:
+	}
+	return nil
 }
 
 type warmTask struct {
@@ -2088,11 +2117,11 @@ func (service *trackedService) startModelCatalogRefresh(ctx context.Context) (<-
 }
 
 func (service *trackedService) modelCatalogAccountIDs() []string {
-	statuses := service.pool.Status()
-	accountIDs := make([]string, 0, len(statuses))
-	for _, status := range statuses {
-		if status.Enabled && (status.State == aistudio.AccountReady || status.State == aistudio.AccountBusy) {
-			accountIDs = append(accountIDs, status.ID)
+	overviews := service.pool.AccountOverviews()
+	accountIDs := make([]string, 0, len(overviews))
+	for _, overview := range overviews {
+		if overview.Enabled && (overview.State == aistudio.AccountReady || overview.State == aistudio.AccountBusy) {
+			accountIDs = append(accountIDs, overview.ID)
 		}
 	}
 	sort.Strings(accountIDs)
@@ -2217,6 +2246,11 @@ func (service *trackedService) removeAccountModelRetry(accountID string) {
 	service.modelRetriesMu.Lock()
 	delete(service.modelRetries, accountID)
 	service.modelRetriesMu.Unlock()
+	// 同步清理观测数据:否则账户删除后其 performance 条目永久残留,
+	// 账户反复增删时 map 无限增长(此前仅 Start 时全量清空)
+	service.performanceMu.Lock()
+	delete(service.performance, accountID)
+	service.performanceMu.Unlock()
 }
 
 func (service *trackedService) pendingModelRetryIDs() []string {
@@ -2246,9 +2280,9 @@ func (service *trackedService) modelRetryPending(accountID string) bool {
 
 func (service *trackedService) authRequiredAccountIDs() map[string]struct{} {
 	accountIDs := make(map[string]struct{})
-	for _, status := range service.pool.Status() {
-		if status.State == aistudio.AccountAuthRequired {
-			accountIDs[status.ID] = struct{}{}
+	for _, overview := range service.pool.AccountOverviews() {
+		if overview.State == aistudio.AccountAuthRequired {
+			accountIDs[overview.ID] = struct{}{}
 		}
 	}
 	return accountIDs
@@ -2518,6 +2552,10 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		// 先取广播通道引用再检查池状态:若状态检查后发生任意变更
+		// (租约释放/冷却结束),该通道必然已关闭,等待方立即唤醒;
+		// 若在检查前发生,则本轮分类已看到新状态,无需唤醒。
+		changed := service.pool.Changed()
 		warm := service.workers.ReadyWarmAccountIDs()
 		active := service.workers.WarmAccountIDs()
 		groups, err := service.pool.ClassifyCandidates(ctx, selection, warm)
@@ -2544,7 +2582,7 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			}
 		}
 		if len(groups.StandbyReady) == 0 && opening {
-			if err := waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
+			if err := service.waitWarmCandidate(ctx, changed, 100*time.Millisecond); err != nil {
 				return nil, err
 			}
 			continue
@@ -2567,7 +2605,7 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 				return nil, acquireErr
 			}
 			if lease == nil {
-				if err := waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
+				if err := service.waitWarmCandidate(ctx, changed, 100*time.Millisecond); err != nil {
 					return nil, err
 				}
 				continue
@@ -2589,13 +2627,13 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			continue
 		}
 		if len(groups.WarmBusy) > 0 || len(groups.StandbyBusy) > 0 || opening {
-			if err := waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
+			if err := service.waitWarmCandidate(ctx, changed, 100*time.Millisecond); err != nil {
 				return nil, err
 			}
 			continue
 		}
 		if !groups.EarliestCooldown.IsZero() {
-			if err := waitWarmCandidate(ctx, min(time.Until(groups.EarliestCooldown), 100*time.Millisecond)); err != nil {
+			if err := service.waitWarmCandidate(ctx, changed, min(time.Until(groups.EarliestCooldown), 100*time.Millisecond)); err != nil {
 				return nil, err
 			}
 			continue
@@ -2604,15 +2642,22 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 	}
 }
 
-func waitWarmCandidate(ctx context.Context, delay time.Duration) error {
+// waitWarmCandidate 等待池内可用账户或定时器到期。
+// changed 必须是状态检查之前获取的通道引用(见 acquireWarmLease 循环顶部),
+// 否则会拿到重建后的新通道而错过已发生的唤醒。
+// 纯定时轮询改为事件驱动:租约释放/状态迁移/冷却标记都会关闭
+// pool.changed 广播,等待方可立即重试,将排队尾延迟从平均 50ms 降至微秒级;
+// 定时器仅作为 worker 预热(非池事件)的兜底。
+func (service *trackedService) waitWarmCandidate(ctx context.Context, changed <-chan struct{}, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-changed:
 	case <-timer.C:
-		return nil
 	}
+	return nil
 }
 
 const streamStallThreshold = 15 * time.Second
@@ -2759,8 +2804,8 @@ func (service *trackedService) generateWithRetry(
 	fileBound := requestedAccountID == "" && resourceID != ""
 	if unbound || fileBound {
 		eligible := 0
-		for _, status := range service.pool.Status() {
-			if status.Enabled && (status.State == aistudio.AccountReady || status.State == aistudio.AccountBusy) {
+		for _, overview := range service.pool.AccountOverviews() {
+			if overview.Enabled && (overview.State == aistudio.AccountReady || overview.State == aistudio.AccountBusy) {
 				eligible++
 			}
 		}
@@ -2796,9 +2841,9 @@ func (service *trackedService) generateWithRetry(
 			AccountID: selectionAccountID, ResourceID: selectionResourceID,
 		}
 		if (unbound || fileBound) && len(attempted) > 0 {
-			for _, status := range service.pool.Status() {
-				if _, exists := attempted[status.ID]; status.Enabled && !exists {
-					selection.AllowedAccountIDs = append(selection.AllowedAccountIDs, status.ID)
+			for _, overview := range service.pool.AccountOverviews() {
+				if _, exists := attempted[overview.ID]; overview.Enabled && !exists {
+					selection.AllowedAccountIDs = append(selection.AllowedAccountIDs, overview.ID)
 				}
 			}
 		}
@@ -3046,7 +3091,16 @@ func firstGenerateEvent(ctx context.Context, source <-chan aistudio.Event, onWai
 			if event.Kind != aistudio.EventError {
 				return event, nil
 			}
-			for range source {
+			// 排空余下事件,但必须响应 ctx 取消:
+			// 若上游因异常未关闭 channel,无保护的 for-range 会永久阻塞,
+			// 造成 goroutine 泄漏且请求租约迟迟不释放
+			for draining := true; draining; {
+				select {
+				case _, ok := <-source:
+					draining = ok
+				case <-ctx.Done():
+					draining = false
+				}
 			}
 			if event.Err != nil {
 				return aistudio.Event{}, event.Err

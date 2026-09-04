@@ -132,7 +132,7 @@ func cloneResponseContents(contents []aistudio.Content) []aistudio.Content {
 
 func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var request responsesRequest
-	if err := decodeJSON(r, &request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -726,9 +726,7 @@ func (writer *responsesStreamWriter) live(event aistudio.Event) error {
 		if err != nil {
 			return err
 		}
-		return writer.emit("response.reasoning_summary_text.delta", map[string]any{
-			"item_id": "rs_" + writer.id, "output_index": index, "summary_index": 0, "delta": event.Text,
-		})
+		return writer.emitReasoningDelta("rs_"+writer.id, index, event.Text)
 	case aistudio.EventText:
 		if writer.searchProbe {
 			writer.pendingText = append(writer.pendingText, event.Text)
@@ -772,9 +770,28 @@ func (writer *responsesStreamWriter) emitText(text string) error {
 	if err != nil {
 		return err
 	}
-	return writer.emit("response.output_text.delta", map[string]any{
-		"item_id": "msg_" + writer.id, "output_index": index, "content_index": 0, "delta": text, "logprobs": []any{},
-	})
+	return writer.emitTextDelta("msg_"+writer.id, index, text)
+}
+
+// emitTextDelta 与 emitReasoningDelta 是每 token 触发的最热帧,改用 struct
+// 静态序列化(M2),绕过通用 map emit 的逐帧反射与键排序;键集与旧 map
+// 完全一致(type/sequence_number 由 emit 语义内联到 struct 字段)。
+func (writer *responsesStreamWriter) emitTextDelta(itemID string, outputIndex int, delta string) error {
+	payload := responsesTextDeltaOut{
+		Type: "response.output_text.delta", SequenceNumber: writer.sequence,
+		ItemID: itemID, OutputIndex: outputIndex, ContentIndex: 0, Delta: delta, Logprobs: []any{},
+	}
+	writer.sequence++
+	return writeSSE(writer.w, "response.output_text.delta", payload)
+}
+
+func (writer *responsesStreamWriter) emitReasoningDelta(itemID string, outputIndex int, delta string) error {
+	payload := responsesReasoningDeltaOut{
+		Type: "response.reasoning_summary_text.delta", SequenceNumber: writer.sequence,
+		ItemID: itemID, OutputIndex: outputIndex, SummaryIndex: 0, Delta: delta,
+	}
+	writer.sequence++
+	return writeSSE(writer.w, "response.reasoning_summary_text.delta", payload)
 }
 
 func (writer *responsesStreamWriter) flushPendingText() error {

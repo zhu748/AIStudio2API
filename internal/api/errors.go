@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
@@ -24,7 +26,16 @@ type errorCodeProvider interface {
 	ErrorCode() string
 }
 
-func decodeJSON(r *http.Request, target any) error {
+// maxJSONBodyBytes 限制 JSON API 请求体的最大字节数。
+// 请求体可能携带内联 base64 媒体(图片/音频),故需要留足空间;
+// 但无上限时攻击者可用超大 JSON 直接耗尽内存(OOM DoS)。
+const maxJSONBodyBytes int64 = 64 << 20 // 64MB
+
+// decodeJSON 解析 JSON 请求体到 target,并施加请求体大小上限。
+// 超限时返回 *http.MaxBytesError,调用方可映射为 413。
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	// MaxBytesReader 需要 w 以便在超限时尽早断开连接
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(target); err != nil {
 		return err
@@ -52,43 +63,63 @@ func streamHeaders(w http.ResponseWriter) {
 	}
 }
 
-func writeSSE(w http.ResponseWriter, event string, payload any) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	if event != "" {
-		if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
-			return err
-		}
-	}
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+// sseBufferPool 复用 SSE 帧拼装缓冲,避免流式高并发下的分配风暴。
+var sseBufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// writeSSEFrame 在单个缓冲内拼装完整 SSE 帧并一次性写出。
+// 此前每个事件 2 次 fmt.Fprintf(各自独立 w.Write→2 个 TCP 段)
+// + 反射式格式化;流式 chat 每秒上百事件时 syscall 翻倍。
+func writeSSEFrame(w http.ResponseWriter, appendFrame func(*bytes.Buffer)) error {
+	buffer := sseBufferPool.Get().(*bytes.Buffer)
+	defer sseBufferPool.Put(buffer)
+	buffer.Reset()
+	appendFrame(buffer)
+	return writeBufferedSSE(w, buffer)
+}
+
+// writeBufferedSSE 写出已拼装完成的帧并立即刷新
+func writeBufferedSSE(w http.ResponseWriter, buffer *bytes.Buffer) error {
+	if _, err := w.Write(buffer.Bytes()); err != nil {
 		return err
 	}
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
 	return nil
+}
+
+// writeSSE 序列化 payload 并在单个复用缓冲内拼装完整 SSE 帧一次性写出(M7)。
+// 直接用 json.Encoder 编码进池化缓冲,省去 Marshal 的中间 []byte 分配
+// 与二次拷贝;Encoder 自带的尾部换行恰好充当 SSE 帧的第一个换行。
+func writeSSE(w http.ResponseWriter, event string, payload any) error {
+	buffer := sseBufferPool.Get().(*bytes.Buffer)
+	defer sseBufferPool.Put(buffer)
+	buffer.Reset()
+	if event != "" {
+		buffer.WriteString("event: ")
+		buffer.WriteString(event)
+		buffer.WriteByte('\n')
+	}
+	buffer.WriteString("data: ")
+	if err := json.NewEncoder(buffer).Encode(payload); err != nil {
+		return err
+	}
+	buffer.WriteByte('\n')
+	return writeBufferedSSE(w, buffer)
 }
 
 func writeSSEText(w http.ResponseWriter, data string) error {
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-		return err
-	}
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
-	return nil
+	return writeSSEFrame(w, func(buffer *bytes.Buffer) {
+		buffer.WriteString("data: ")
+		buffer.WriteString(data)
+		buffer.WriteString("\n\n")
+	})
 }
 
 func writeSSEHeartbeat(w http.ResponseWriter) error {
-	if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
-		return err
-	}
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
-	return nil
+	return writeSSEFrame(w, func(buffer *bytes.Buffer) {
+		buffer.WriteString(": ping\n\n")
+	})
 }
 
 func statusFromError(err error) int {

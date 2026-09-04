@@ -34,10 +34,16 @@ type runtimeAdmin struct {
 	config     config.Config
 }
 
-// requestRegistry 保存活动请求与事件订阅
+// requestRegistry 保存活动请求与事件订阅。
+// 拆分为两把锁:requestsMu 仅保护活动请求表,
+// eventsMu 保护日志环与订阅者扇出。此前单一互斥锁下,
+// 高频日志扇出(每 worker 事件一条)会阻塞请求的
+// start/finish/cancel 等生命周期操作,反之亦然。
+// 锁序:嵌套时仅允许 eventsMu → requestsMu(见 activateSubscriber)。
 type requestRegistry struct {
-	mu          sync.Mutex
+	requestsMu  sync.Mutex
 	active      map[string]trackedRequest
+	eventsMu    sync.Mutex
 	logs        []api.AdminLog
 	subscribers map[*eventSubscriber]struct{}
 	console     chan api.AdminLog
@@ -1020,43 +1026,53 @@ func (registry *requestRegistry) start(request aistudio.GenerateRequest, cancel 
 		},
 		cancel: cancel,
 	}
-	registry.mu.Lock()
+	registry.requestsMu.Lock()
 	registry.active[request.ID] = tracked
+	registry.requestsMu.Unlock()
+	registry.eventsMu.Lock()
 	registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
-	registry.mu.Unlock()
+	registry.eventsMu.Unlock()
 }
 
 func (registry *requestRegistry) markRunning(id string, accountID string, accountLabel string) {
-	registry.mu.Lock()
+	registry.requestsMu.Lock()
 	tracked, exists := registry.active[id]
 	if exists {
 		tracked.request.AccountID = accountID
 		tracked.request.AccountLabel = accountLabel
 		tracked.request.State = "running"
 		registry.active[id] = tracked
-		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
 	}
-	registry.mu.Unlock()
+	registry.requestsMu.Unlock()
+	if exists {
+		registry.eventsMu.Lock()
+		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
+		registry.eventsMu.Unlock()
+	}
 }
 
 func (registry *requestRegistry) finish(id string, state string, requestErr error) {
-	registry.mu.Lock()
+	registry.requestsMu.Lock()
 	tracked, exists := registry.active[id]
 	if exists {
 		delete(registry.active, id)
 		tracked.request.State = state
-		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
 	}
-	registry.mu.Unlock()
+	registry.requestsMu.Unlock()
+	if exists {
+		registry.eventsMu.Lock()
+		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
+		registry.eventsMu.Unlock()
+	}
 }
 
 func (registry *requestRegistry) list() []api.AdminRequest {
-	registry.mu.Lock()
+	registry.requestsMu.Lock()
 	requests := make([]api.AdminRequest, 0, len(registry.active))
 	for _, tracked := range registry.active {
 		requests = append(requests, tracked.request)
 	}
-	registry.mu.Unlock()
+	registry.requestsMu.Unlock()
 	sort.Slice(requests, func(left int, right int) bool {
 		return requests[left].StartedAt.Before(requests[right].StartedAt)
 	})
@@ -1064,16 +1080,16 @@ func (registry *requestRegistry) list() []api.AdminRequest {
 }
 
 func (registry *requestRegistry) count() int {
-	registry.mu.Lock()
+	registry.requestsMu.Lock()
 	count := len(registry.active)
-	registry.mu.Unlock()
+	registry.requestsMu.Unlock()
 	return count
 }
 
 func (registry *requestRegistry) cancel(id string) error {
-	registry.mu.Lock()
+	registry.requestsMu.Lock()
 	tracked, exists := registry.active[id]
-	registry.mu.Unlock()
+	registry.requestsMu.Unlock()
 	if !exists {
 		return &adminOperationError{
 			status: http.StatusNotFound, code: "request_not_found",
@@ -1092,21 +1108,21 @@ func logDuration(value time.Duration) string {
 }
 
 func (registry *requestRegistry) cancelAll() {
-	registry.mu.Lock()
+	registry.requestsMu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(registry.active))
 	for _, tracked := range registry.active {
 		cancels = append(cancels, tracked.cancel)
 	}
-	registry.mu.Unlock()
+	registry.requestsMu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
 	}
 }
 
 func (registry *requestRegistry) log(source string, level string, message string) {
-	registry.mu.Lock()
+	registry.eventsMu.Lock()
 	entry := registry.appendLogLocked(source, level, message)
-	registry.mu.Unlock()
+	registry.eventsMu.Unlock()
 	select {
 	case registry.console <- entry:
 	default:
@@ -1143,9 +1159,9 @@ func (registry *requestRegistry) writeConsole(ctx context.Context) {
 }
 
 func (registry *requestRegistry) clearLogs() {
-	registry.mu.Lock()
+	registry.eventsMu.Lock()
 	registry.logs = registry.logs[:0]
-	registry.mu.Unlock()
+	registry.eventsMu.Unlock()
 }
 
 // newEventSubscriber 创建管理页有界事件队列
@@ -1283,35 +1299,42 @@ func (subscriber *eventSubscriber) run() {
 
 func (registry *requestRegistry) subscribe(ctx context.Context) *eventSubscriber {
 	subscriber := newEventSubscriber(ctx)
-	registry.mu.Lock()
+	registry.eventsMu.Lock()
 	registry.subscribers[subscriber] = struct{}{}
-	registry.mu.Unlock()
+	registry.eventsMu.Unlock()
 	go func() {
 		<-ctx.Done()
-		registry.mu.Lock()
+		registry.eventsMu.Lock()
 		delete(registry.subscribers, subscriber)
-		registry.mu.Unlock()
+		registry.eventsMu.Unlock()
 	}()
 	return subscriber
 }
 
-// activateSubscriber 原子衔接日志请求快照与实时事件
+// activateSubscriber 原子衔接日志请求快照与实时事件。
+// 锁序为 eventsMu → requestsMu 嵌套:先在 eventsMu 下截取日志快照并注册
+// 订阅者(保证日志无丢失),再在 requestsMu 下截取请求快照。
+// 若某请求的 map 写入发生在注册之后,其事件必然也已发布给订阅者;
+// 若在注册之前,则必然已被请求快照覆盖(重复事件仅是幂等的状态回放)。
 func (registry *requestRegistry) activateSubscriber(
 	subscriber *eventSubscriber,
 	prefix []api.AdminEvent,
 	suffix []api.AdminEvent,
 ) <-chan api.AdminEvent {
-	registry.mu.Lock()
-	initial := make([]api.AdminEvent, 0, len(prefix)+len(registry.logs)+len(suffix)+len(registry.active))
+	registry.eventsMu.Lock()
+	defer registry.eventsMu.Unlock()
+	initial := make([]api.AdminEvent, 0, len(prefix)+len(registry.logs)+len(suffix))
 	initial = append(initial, prefix...)
 	for _, entry := range registry.logs {
 		initial = append(initial, api.AdminEvent{Type: "log", Data: entry})
 	}
 	initial = append(initial, suffix...)
+	registry.requestsMu.Lock()
 	requests := make([]api.AdminRequest, 0, len(registry.active))
 	for _, tracked := range registry.active {
 		requests = append(requests, tracked.request)
 	}
+	registry.requestsMu.Unlock()
 	sort.Slice(requests, func(left int, right int) bool {
 		return requests[left].StartedAt.Before(requests[right].StartedAt)
 	})
@@ -1319,7 +1342,6 @@ func (registry *requestRegistry) activateSubscriber(
 		initial = append(initial, api.AdminEvent{Type: "request", Data: request})
 	}
 	subscriber.activate(initial)
-	registry.mu.Unlock()
 	go subscriber.run()
 	return subscriber.events
 }
@@ -1332,9 +1354,9 @@ func (registry *requestRegistry) publishLocked(event api.AdminEvent) {
 
 // publish 向管理页订阅者发布增量事件
 func (registry *requestRegistry) publish(event api.AdminEvent) {
-	registry.mu.Lock()
+	registry.eventsMu.Lock()
 	registry.publishLocked(event)
-	registry.mu.Unlock()
+	registry.eventsMu.Unlock()
 }
 
 func buildVersion() string {

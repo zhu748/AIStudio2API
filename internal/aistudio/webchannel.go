@@ -1088,6 +1088,10 @@ func parseWebChannelACK(source io.Reader) error {
 	return nil
 }
 
+// webChannelFrameMaxBytes 限制单个 WebChannel frame 的最大长度。
+// 防止异常/恶意的上游声明超大帧长度直接触发海量分配导致 OOM。
+const webChannelFrameMaxBytes = 8 << 20 // 8MB
+
 func readWebChannelFrames(source io.Reader, emit func(json.RawMessage) error) error {
 	reader := bufio.NewReader(source)
 	for {
@@ -1096,7 +1100,7 @@ func readWebChannelFrames(source io.Reader, emit func(json.RawMessage) error) er
 			return err
 		}
 		length, err := strconv.Atoi(strings.TrimSpace(lengthLine))
-		if err != nil || length < 0 {
+		if err != nil || length < 0 || length > webChannelFrameMaxBytes {
 			return fmt.Errorf("bidi WebChannel frame 长度无效: %q", strings.TrimSpace(lengthLine))
 		}
 		frame := make([]byte, length)

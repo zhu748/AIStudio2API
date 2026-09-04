@@ -88,10 +88,16 @@ func (node *vlessOutbound) dial(ctx context.Context, _, address string) (net.Con
 	}
 	// 响应头: version(1B) + addon length(1B),消费后裸流透传。
 	// xray/sing-box 服务端无论 TCP 还是 WS 传输都会把响应头写进
-	// 数据流开头,必须消费掉,否则调用方首读会错位
+	// 数据流开头,必须消费掉,否则调用方首读会错位。
+	// 读取置于 deadline+ctx 保护下:失联服务器不再永久挂住拨号 goroutine
 	var responseHeader [2]byte
-	if _, err := io.ReadFull(conn, responseHeader[:]); err != nil {
-		return nil, fmt.Errorf("读取 VLESS 响应头失败: %w", err)
+	if err := readProtocolHeader(ctx, conn, func() error {
+		if _, err := io.ReadFull(conn, responseHeader[:]); err != nil {
+			return fmt.Errorf("读取 VLESS 响应头失败: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	if responseHeader[0] != 0x00 {
 		return nil, fmt.Errorf("VLESS 响应版本不支持: %d", responseHeader[0])

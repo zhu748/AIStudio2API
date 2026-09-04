@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // ServeSOCKS5 在 127.0.0.1 随机端口启动一个仅支持 CONNECT 的无鉴权
@@ -46,6 +47,9 @@ func handleSOCKS5Session(ctx context.Context, conn net.Conn, outbound *Outbound)
 	defer func() {
 		_ = conn.Close()
 	}()
+	// 协商阶段设置读超时:客户端连上不发数据(或半开连接)时,
+	// 会话 goroutine 不能无限阻塞占用资源
+	_ = conn.SetReadDeadline(time.Now().Add(protocolHeaderTimeout))
 	// 阶段一:协商方法(仅支持无鉴权 0x00)
 	var greeting [2]byte
 	if _, err := io.ReadFull(conn, greeting[:]); err != nil {
@@ -97,6 +101,8 @@ func handleSOCKS5Session(ctx context.Context, conn net.Conn, outbound *Outbound)
 	if _, err := writeSOCKS5Reply(conn, 0x00); err != nil {
 		return
 	}
+	// 协商完成,进入透传前恢复无 deadline
+	_ = conn.SetReadDeadline(time.Time{})
 	// 阶段三:双向透传
 	var relay sync.WaitGroup
 	relay.Add(2)

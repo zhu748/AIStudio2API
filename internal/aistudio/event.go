@@ -19,7 +19,10 @@ func NewFrameDecoder() *FrameDecoder {
 
 // Decode 解码一条 repeated 流帧
 func (d *FrameDecoder) Decode(raw json.RawMessage) ([]Event, error) {
-	d.lastFrame = append(json.RawMessage(nil), raw...)
+	// 仅保存引用:raw 是 decoder 产出的独立分配切片,调用方不再持有;
+	// 真正构造证据错误时 protocolError 会自行克隆。
+	// 此前每帧都全量拷贝一份(含 base64 媒体帧),纯属浪费。
+	d.lastFrame = raw
 	frame, err := rawArray(raw, "$[0][]", raw)
 	if err != nil {
 		return nil, withMethod(err, "GenerateContent")

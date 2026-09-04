@@ -58,7 +58,7 @@ func (s *server) handleGeminiVideoCreate(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	var request geminiVideoRequest
-	if err := decodeJSON(r, &request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -172,8 +172,13 @@ func (s *server) handleOpenAIVideoCreate(w http.ResponseWriter, r *http.Request)
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "video generation is unavailable")
 		return
 	}
-	request, image, err := parseOpenAIVideoRequest(r)
+	request, image, err := parseOpenAIVideoRequest(w, r)
 	if err != nil {
+		var maxBytes *http.MaxBytesError
+		if errors.As(err, &maxBytes) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request", err.Error())
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -193,7 +198,15 @@ func (s *server) handleOpenAIVideoCreate(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, openAIVideoObject(operation))
 }
 
-func parseOpenAIVideoRequest(r *http.Request) (openAIVideoRequest, *aistudio.VideoImage, error) {
+// openAIVideoMaxBytes 限制 /v1/videos 请求(JSON 或 multipart)的总字节上限。
+const openAIVideoMaxBytes int64 = 64 << 20 // 64MB
+
+// openAIVideoReferenceMaxBytes 限制 input_reference 参考图的最大字节。
+const openAIVideoReferenceMaxBytes int64 = 32 << 20 // 32MB
+
+func parseOpenAIVideoRequest(w http.ResponseWriter, r *http.Request) (openAIVideoRequest, *aistudio.VideoImage, error) {
+	// 统一限制请求体总大小,防止超大 multipart 把内存/临时盘打爆
+	r.Body = http.MaxBytesReader(w, r.Body, openAIVideoMaxBytes)
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
 		return openAIVideoRequest{}, nil, fmt.Errorf("invalid Content-Type")
@@ -202,7 +215,7 @@ func parseOpenAIVideoRequest(r *http.Request) (openAIVideoRequest, *aistudio.Vid
 	var image *aistudio.VideoImage
 	switch mediaType {
 	case "application/json":
-		if err := decodeJSON(r, &request); err != nil {
+		if err := decodeJSON(w, r, &request); err != nil {
 			return request, nil, err
 		}
 		if request.InputReference != "" {
@@ -214,6 +227,10 @@ func parseOpenAIVideoRequest(r *http.Request) (openAIVideoRequest, *aistudio.Vid
 		}
 	case "multipart/form-data":
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			var maxBytes *http.MaxBytesError
+			if errors.As(err, &maxBytes) {
+				return request, nil, fmt.Errorf("request body exceeds %d bytes limit", openAIVideoMaxBytes)
+			}
 			return request, nil, err
 		}
 		defer r.MultipartForm.RemoveAll()
@@ -224,9 +241,13 @@ func parseOpenAIVideoRequest(r *http.Request) (openAIVideoRequest, *aistudio.Vid
 		file, header, err := r.FormFile("input_reference")
 		if err == nil {
 			defer file.Close()
-			data, readErr := io.ReadAll(file)
+			// 参考图设置上限,避免无界 ReadAll 耗尽内存
+			data, readErr := io.ReadAll(io.LimitReader(file, openAIVideoReferenceMaxBytes+1))
 			if readErr != nil {
 				return request, nil, readErr
+			}
+			if int64(len(data)) > openAIVideoReferenceMaxBytes {
+				return request, nil, fmt.Errorf("input_reference exceeds %d bytes limit", openAIVideoReferenceMaxBytes)
 			}
 			mimeType := header.Header.Get("Content-Type")
 			if mimeType == "" {

@@ -252,7 +252,7 @@ func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	var input AccountCreateInput
-	if err := decodeJSON(r, &input); err != nil {
+	if err := decodeJSON(w, r, &input); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -275,7 +275,7 @@ func (s *server) handleChromeImportProfiles(w http.ResponseWriter, r *http.Reque
 
 func (s *server) handleImportChromeAccounts(w http.ResponseWriter, r *http.Request) {
 	var input ChromeImportInput
-	if err := decodeJSON(r, &input); err != nil {
+	if err := decodeJSON(w, r, &input); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -289,7 +289,7 @@ func (s *server) handleImportChromeAccounts(w http.ResponseWriter, r *http.Reque
 
 func (s *server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	var input AccountInput
-	if err := decodeJSON(r, &input); err != nil {
+	if err := decodeJSON(w, r, &input); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -364,7 +364,7 @@ func (s *server) handleRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleUpdateRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 	var config RuntimeConfig
-	if err := decodeJSON(r, &config); err != nil {
+	if err := decodeJSON(w, r, &config); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}

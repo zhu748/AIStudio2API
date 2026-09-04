@@ -77,7 +77,7 @@ type anthropicContentBlock struct {
 
 func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	var request anthropicRequest
-	if err := decodeJSON(r, &request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -133,7 +133,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 func (s *server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 	var request anthropicRequest
-	if err := decodeJSON(r, &request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -482,93 +482,155 @@ func anthropicToolChoice(raw json.RawMessage) (aistudio.ToolConfig, error) {
 	}
 }
 
-func buildAnthropicResponse(id string, model string, result generationResult) map[string]any {
+func buildAnthropicResponse(id string, model string, result generationResult) anthropicMessageResponseOut {
 	stopReason, stopSequence := anthropicStop(result.finishReason, len(result.toolCalls) > 0, result.stopSequence)
-	response := map[string]any{
-		"id":            id,
-		"type":          "message",
-		"role":          "assistant",
-		"model":         model,
-		"content":       anthropicBlocks(result),
-		"stop_reason":   stopReason,
-		"stop_sequence": stopSequence,
+	response := anthropicMessageResponseOut{
+		ID:           id,
+		Type:         "message",
+		Role:         "assistant",
+		Model:        model,
+		Content:      anthropicBlocks(result),
+		StopReason:   stopReason,
+		StopSequence: stopSequence,
 	}
 	if result.providerModel != "" {
-		response["provider_model"] = result.providerModel
+		response.ProviderModel = result.providerModel
 	}
 	if providerReason := providerFinishReason(result.finishReason); providerReason != "" {
-		response["provider_finish_reason"] = providerReason
+		response.ProviderFinishReason = providerReason
 	}
 	if result.usage != nil {
-		response["usage"] = anthropicUsage(result.usage)
+		response.Usage = &anthropicUsageBody{
+			InputTokens:  inputTokens(result.usage),
+			OutputTokens: outputTokens(result.usage),
+		}
 	}
 	return response
 }
-
 func anthropicBlocks(result generationResult) []anthropicContentBlock {
-	blocks := make([]anthropicContentBlock, 0)
+	acc := newBlockAccumulator()
 	for _, event := range result.events {
 		switch event.Kind {
 		case aistudio.EventText:
-			if len(blocks) > 0 && blocks[len(blocks)-1].Type == "text" {
-				blocks[len(blocks)-1].Text += event.Text
-			} else {
-				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: event.Text})
-			}
+			acc.appendTextPair(event.Text, event.Text)
 		case aistudio.EventReasoning:
-			if len(blocks) > 0 && blocks[len(blocks)-1].Type == "thinking" {
-				*blocks[len(blocks)-1].Thinking += event.Text
-				if event.ThoughtSignature != "" {
-					blocks[len(blocks)-1].Signature = event.ThoughtSignature
-				}
-			} else {
-				thinking := event.Text
-				blocks = append(blocks, anthropicContentBlock{Type: "thinking", Thinking: &thinking, Signature: event.ThoughtSignature})
-			}
+			acc.appendThinking(event.Text, event.ThoughtSignature)
 		case aistudio.EventThoughtSignature:
 			if event.ThoughtSignature == "" {
 				continue
 			}
-			blocks = append(blocks, anthropicContentBlock{Type: "redacted_thinking", Data: event.ThoughtSignature})
+			acc.append(anthropicContentBlock{Type: "redacted_thinking", Data: event.ThoughtSignature})
 		case aistudio.EventToolCall:
 			if event.ToolCall != nil {
 				if event.ToolCall.ThoughtSignature != "" {
-					if len(blocks) > 0 && blocks[len(blocks)-1].Type == "thinking" {
-						blocks[len(blocks)-1].Signature = event.ToolCall.ThoughtSignature
+					if acc.lastIsThinking() {
+						// 与旧实现一致:末块为 thinking 时原地更新签名,不派生新块
+						acc.blocks[len(acc.blocks)-1].Signature = event.ToolCall.ThoughtSignature
 					} else {
-						blocks = append(blocks, anthropicContentBlock{
+						acc.append(anthropicContentBlock{
 							Type: "redacted_thinking", Data: event.ToolCall.ThoughtSignature,
 						})
 					}
 				}
-				blocks = append(blocks, anthropicContentBlock{
+				acc.append(anthropicContentBlock{
 					Type: "tool_use", ID: event.ToolCall.ID, Name: event.ToolCall.Name, Input: event.ToolCall.Arguments,
 				})
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
-				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: renderMediaMarkdown(*event.Media)})
+				// 媒体总是派生新块(与旧实现一致);但后续文本事件仍会并入
+				acc.appendTextBlock(renderMediaMarkdown(*event.Media))
 			}
 		case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 			rendered := renderCodeExecution(event)
 			if rendered == "" {
 				continue
 			}
-			if len(blocks) > 0 && blocks[len(blocks)-1].Type == "text" {
-				blocks[len(blocks)-1].Text += "\n" + rendered + "\n"
-			} else {
-				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: rendered + "\n"})
-			}
+			acc.appendTextPair("\n"+rendered+"\n", rendered+"\n")
 		}
 	}
 	if sources := renderCitationsMarkdown(result.citations); sources != "" {
-		if len(blocks) > 0 && blocks[len(blocks)-1].Type == "text" {
-			blocks[len(blocks)-1].Text += "\n\n" + sources
-		} else {
-			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: sources})
-		}
+		acc.appendTextPair("\n\n"+sources, sources)
 	}
-	return blocks
+	acc.seal()
+	return acc.blocks
+}
+
+// blockAccumulator 维护 content 块列表与末块的延迟固化缓冲。
+// 仅末块会被追加文本;追加到其它块类型的请求按旧语义派生新块。
+type blockAccumulator struct {
+	blocks          []anthropicContentBlock
+	textBuilder     *strings.Builder // 末块为 text 且累积中(尾块 Text 尚未固化)
+	thinkingBuilder *strings.Builder // 末块为 thinking 且累积中
+	thinkingTarget  *string          // 末块 Thinking 指针(固化时回写)
+}
+
+func newBlockAccumulator() *blockAccumulator {
+	return &blockAccumulator{blocks: make([]anthropicContentBlock, 0)}
+}
+
+// seal 把缓冲内容固化到末块,结束追加窗口。
+func (acc *blockAccumulator) seal() {
+	if acc.textBuilder != nil {
+		acc.blocks[len(acc.blocks)-1].Text = acc.textBuilder.String()
+		acc.textBuilder = nil
+	}
+	if acc.thinkingBuilder != nil {
+		*acc.thinkingTarget = acc.thinkingBuilder.String()
+		acc.thinkingBuilder = nil
+		acc.thinkingTarget = nil
+	}
+}
+
+// append 添加一个内容完整的块(后续不再向其追加)。
+func (acc *blockAccumulator) append(block anthropicContentBlock) {
+	acc.seal()
+	acc.blocks = append(acc.blocks, block)
+}
+
+func (acc *blockAccumulator) lastIsThinking() bool {
+	return len(acc.blocks) > 0 && acc.blocks[len(acc.blocks)-1].Type == "thinking"
+}
+
+// appendTextPair 追加文本:末块为 text 时并入 mergeText,
+// 否则派生新 text 块(初始内容 freshText)。
+func (acc *blockAccumulator) appendTextPair(mergeText string, freshText string) {
+	if acc.textBuilder != nil && len(acc.blocks) > 0 && acc.blocks[len(acc.blocks)-1].Type == "text" {
+		acc.textBuilder.WriteString(mergeText)
+		return
+	}
+	acc.seal()
+	builder := &strings.Builder{}
+	builder.WriteString(freshText)
+	acc.blocks = append(acc.blocks, anthropicContentBlock{Type: "text"})
+	acc.textBuilder = builder
+}
+
+// appendTextBlock 添加一个已渲染完成的 text 块(保留后续文本并入的语义)。
+func (acc *blockAccumulator) appendTextBlock(text string) {
+	acc.seal()
+	builder := &strings.Builder{}
+	builder.WriteString(text)
+	acc.blocks = append(acc.blocks, anthropicContentBlock{Type: "text"})
+	acc.textBuilder = builder
+}
+
+// appendThinking 追加思考文本:末块为 thinking 时并入,否则派生新块。
+func (acc *blockAccumulator) appendThinking(text string, signature string) {
+	if acc.lastIsThinking() && acc.thinkingBuilder != nil {
+		acc.thinkingBuilder.WriteString(text)
+		if signature != "" {
+			acc.blocks[len(acc.blocks)-1].Signature = signature
+		}
+		return
+	}
+	acc.seal()
+	thinking := ""
+	acc.blocks = append(acc.blocks, anthropicContentBlock{Type: "thinking", Thinking: &thinking, Signature: signature})
+	builder := &strings.Builder{}
+	builder.WriteString(text)
+	acc.thinkingBuilder = builder
+	acc.thinkingTarget = &thinking
 }
 
 func anthropicStop(reason string, hasTools bool, stopSequence string) (string, *string) {
@@ -593,24 +655,25 @@ func anthropicStop(reason string, hasTools bool, stopSequence string) (string, *
 	}
 }
 
-func anthropicUsage(usage *aistudio.Usage) map[string]any {
-	return map[string]any{
-		"input_tokens":  inputTokens(usage),
-		"output_tokens": outputTokens(usage),
+func anthropicUsage(usage *aistudio.Usage) anthropicUsageBody {
+	return anthropicUsageBody{
+		InputTokens:  inputTokens(usage),
+		OutputTokens: outputTokens(usage),
 	}
 }
 
 func writeAnthropicModels(w http.ResponseWriter, models []aistudio.Model) {
-	data := make([]map[string]any, 0, len(models))
+	data := make([]anthropicModelItemOut, 0, len(models))
 	for _, model := range models {
-		data = append(data, map[string]any{
-			"id": model.ID, "type": "model", "display_name": model.Name, "created_at": "1970-01-01T00:00:00Z",
+		data = append(data, anthropicModelItemOut{
+			ID: model.ID, Type: "model", DisplayName: model.Name, CreatedAt: "1970-01-01T00:00:00Z",
 		})
 	}
-	response := map[string]any{"data": data, "has_more": false, "first_id": nil, "last_id": nil}
+	response := anthropicModelsListOut{Data: data, HasMore: false}
 	if len(models) > 0 {
-		response["first_id"] = models[0].ID
-		response["last_id"] = models[len(models)-1].ID
+		first, last := models[0].ID, models[len(models)-1].ID
+		response.FirstID = &first
+		response.LastID = &last
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -641,12 +704,12 @@ func (writer *anthropicStreamWriter) emit(eventType string, payload any) error {
 }
 
 func (writer *anthropicStreamWriter) start() error {
-	return writer.emit("message_start", map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id": writer.id, "type": "message", "role": "assistant", "model": writer.model,
-			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]int64{"input_tokens": writer.inputTokens, "output_tokens": 0},
+	return writer.emit("message_start", anthropicMessageStartEvent{
+		Type: "message_start",
+		Message: anthropicStreamMessage{
+			ID: writer.id, Type: "message", Role: "assistant", Model: writer.model,
+			Content: []anthropicContentBlock{}, StopReason: nil, StopSequence: nil,
+			Usage: anthropicUsageBody{InputTokens: writer.inputTokens, OutputTokens: 0},
 		},
 	})
 }
@@ -657,10 +720,7 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		if err := writer.ensureBlock("text"); err != nil {
 			return err
 		}
-		return writer.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": writer.blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": event.Text},
-		})
+		return writer.emitTextDelta(writer.blockIndex, event.Text)
 	case aistudio.EventReasoning:
 		if err := writer.ensureBlock("thinking"); err != nil {
 			return err
@@ -668,10 +728,7 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		if event.ThoughtSignature != "" {
 			writer.thinkingSignature = event.ThoughtSignature
 		}
-		return writer.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": writer.blockIndex,
-			"delta": map[string]any{"type": "thinking_delta", "thinking": event.Text},
-		})
+		return writer.emitThinkingDelta(writer.blockIndex, event.Text)
 	case aistudio.EventThoughtSignature:
 		if event.ThoughtSignature == "" {
 			return nil
@@ -692,16 +749,17 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		if err := writer.closeBlock(); err != nil {
 			return err
 		}
-		if err := writer.emit("content_block_start", map[string]any{
-			"type": "content_block_start", "index": writer.blockIndex,
-			"content_block": map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": map[string]any{}},
+		if err := writer.emit("content_block_start", anthropicBlockStartEvent{
+			Type: "content_block_start", Index: writer.blockIndex,
+			ContentBlock: anthropicBlockOut{Type: "tool_use", ID: call.ID, Name: call.Name, Input: json.RawMessage("{}")},
 		}); err != nil {
 			return err
 		}
 		writer.currentBlock = "tool_use"
-		if err := writer.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": writer.blockIndex,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": string(call.Arguments)},
+		partial := string(call.Arguments)
+		if err := writer.emit("content_block_delta", anthropicBlockDeltaEvent{
+			Type: "content_block_delta", Index: writer.blockIndex,
+			Delta: anthropicDeltaOut{Type: "input_json_delta", PartialJSON: &partial},
 		}); err != nil {
 			return err
 		}
@@ -716,10 +774,7 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		if err := writer.ensureBlock("text"); err != nil {
 			return err
 		}
-		return writer.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": writer.blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": renderMediaMarkdown(*event.Media)},
-		})
+		return writer.emitTextDelta(writer.blockIndex, renderMediaMarkdown(*event.Media))
 	case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 		rendered := renderCodeExecution(event)
 		if rendered == "" {
@@ -728,12 +783,25 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		if err := writer.ensureBlock("text"); err != nil {
 			return err
 		}
-		return writer.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": writer.blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": "\n" + rendered + "\n"},
-		})
+		return writer.emitTextDelta(writer.blockIndex, "\n"+rendered+"\n")
 	}
 	return nil
+}
+
+// emitTextDelta 发送文本增量帧(空串也照常输出,与旧 map 语义一致)
+func (writer *anthropicStreamWriter) emitTextDelta(index int, text string) error {
+	return writer.emit("content_block_delta", anthropicBlockDeltaEvent{
+		Type: "content_block_delta", Index: index,
+		Delta: anthropicDeltaOut{Type: "text_delta", Text: &text},
+	})
+}
+
+// emitThinkingDelta 发送思考增量帧
+func (writer *anthropicStreamWriter) emitThinkingDelta(index int, text string) error {
+	return writer.emit("content_block_delta", anthropicBlockDeltaEvent{
+		Type: "content_block_delta", Index: index,
+		Delta: anthropicDeltaOut{Type: "thinking_delta", Thinking: &text},
+	})
 }
 
 func (writer *anthropicStreamWriter) ensureBlock(blockType string) error {
@@ -743,14 +811,16 @@ func (writer *anthropicStreamWriter) ensureBlock(blockType string) error {
 	if err := writer.closeBlock(); err != nil {
 		return err
 	}
-	block := map[string]any{"type": blockType}
+	block := anthropicBlockOut{Type: blockType}
 	if blockType == "thinking" {
-		block["thinking"] = ""
+		thinking := ""
+		block.Thinking = &thinking
 	} else {
-		block["text"] = ""
+		text := ""
+		block.Text = &text
 	}
-	if err := writer.emit("content_block_start", map[string]any{
-		"type": "content_block_start", "index": writer.blockIndex, "content_block": block,
+	if err := writer.emit("content_block_start", anthropicBlockStartEvent{
+		Type: "content_block_start", Index: writer.blockIndex, ContentBlock: block,
 	}); err != nil {
 		return err
 	}
@@ -762,14 +832,14 @@ func (writer *anthropicStreamWriter) redactedThinking(data string) error {
 	if err := writer.closeBlock(); err != nil {
 		return err
 	}
-	if err := writer.emit("content_block_start", map[string]any{
-		"type": "content_block_start", "index": writer.blockIndex,
-		"content_block": map[string]any{"type": "redacted_thinking", "data": data},
+	if err := writer.emit("content_block_start", anthropicBlockStartEvent{
+		Type: "content_block_start", Index: writer.blockIndex,
+		ContentBlock: anthropicBlockOut{Type: "redacted_thinking", Data: data},
 	}); err != nil {
 		return err
 	}
-	if err := writer.emit("content_block_stop", map[string]any{
-		"type": "content_block_stop", "index": writer.blockIndex,
+	if err := writer.emit("content_block_stop", anthropicBlockStopEvent{
+		Type: "content_block_stop", Index: writer.blockIndex,
 	}); err != nil {
 		return err
 	}
@@ -782,15 +852,15 @@ func (writer *anthropicStreamWriter) closeBlock() error {
 		return nil
 	}
 	if writer.currentBlock == "thinking" && writer.thinkingSignature != "" {
-		if err := writer.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": writer.blockIndex,
-			"delta": map[string]any{"type": "signature_delta", "signature": writer.thinkingSignature},
+		if err := writer.emit("content_block_delta", anthropicBlockDeltaEvent{
+			Type: "content_block_delta", Index: writer.blockIndex,
+			Delta: anthropicDeltaOut{Type: "signature_delta", Signature: &writer.thinkingSignature},
 		}); err != nil {
 			return err
 		}
 	}
-	if err := writer.emit("content_block_stop", map[string]any{
-		"type": "content_block_stop", "index": writer.blockIndex,
+	if err := writer.emit("content_block_stop", anthropicBlockStopEvent{
+		Type: "content_block_stop", Index: writer.blockIndex,
 	}); err != nil {
 		return err
 	}
@@ -809,41 +879,36 @@ func (writer *anthropicStreamWriter) finish(result generationResult) error {
 		if err := writer.ensureBlock("text"); err != nil {
 			return err
 		}
-		if err := writer.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": writer.blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": prefix + sources},
-		}); err != nil {
+		if err := writer.emitTextDelta(writer.blockIndex, prefix+sources); err != nil {
 			return err
 		}
 	}
 	if err := writer.closeBlock(); err != nil {
 		return err
 	}
-	usage := map[string]int64{"output_tokens": 0}
+	usage := anthropicUsageDeltaOut{OutputTokens: 0}
 	if result.usage != nil {
-		usage["input_tokens"] = inputTokens(result.usage)
-		usage["output_tokens"] = outputTokens(result.usage)
+		input := inputTokens(result.usage)
+		usage.InputTokens = &input
+		usage.OutputTokens = outputTokens(result.usage)
 	}
 	stopReason, stopSequence := anthropicStop(result.finishReason, len(result.toolCalls) > 0, result.stopSequence)
-	delta := map[string]any{
-		"stop_reason": stopReason, "stop_sequence": stopSequence,
-	}
-	if providerReason := providerFinishReason(result.finishReason); providerReason != "" {
-		delta["provider_finish_reason"] = providerReason
-	}
-	if err := writer.emit("message_delta", map[string]any{
-		"type":  "message_delta",
-		"delta": delta,
-		"usage": usage,
+	if err := writer.emit("message_delta", anthropicMessageDeltaEvent{
+		Type: "message_delta",
+		Delta: anthropicMessageDeltaBody{
+			StopReason: stopReason, StopSequence: stopSequence,
+			ProviderFinishReason: providerFinishReason(result.finishReason),
+		},
+		Usage: usage,
 	}); err != nil {
 		return err
 	}
-	return writer.emit("message_stop", map[string]string{"type": "message_stop"})
+	return writer.emit("message_stop", anthropicMessageStopEvent{Type: "message_stop"})
 }
 
 func (writer *anthropicStreamWriter) error(err error) error {
-	return writer.emit("error", map[string]any{
-		"type":  "error",
-		"error": map[string]string{"type": anthropicErrorType(err), "message": err.Error()},
+	return writer.emit("error", anthropicErrorEventOut{
+		Type:  "error",
+		Error: anthropicErrorDetail{Type: anthropicErrorType(err), Message: err.Error()},
 	})
 }
