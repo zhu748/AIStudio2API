@@ -311,7 +311,7 @@ func ValidateProxy(value string) error {
 	if parsed.User != nil {
 		return fmt.Errorf("PROXY 不能包含认证信息")
 	}
-	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("PROXY 不能包含路径、查询参数或片段")
 	}
 	return nil

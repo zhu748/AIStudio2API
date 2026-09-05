@@ -324,3 +324,190 @@ func TestBootstrapModelsAliasSemantics(t *testing.T) {
 		t.Errorf("合格模型主 ID 应保留,实际 %v", models)
 	}
 }
+
+// TestAcquireForDuringCooldown 是 RLock/Unlock 失配的回归测试。
+// 账户全部处于冷却时 AcquireFor 会进入 refreshSelectionRuntimes;
+// 修复前该函数在 RLock 后误调 Unlock,触发
+// "fatal error: sync: unlock of unlocked mutex" 使整个进程崩溃
+// (触发条件仅为任一账号进入冷却,常规负载即可命中)。
+func TestAcquireForDuringCooldown(t *testing.T) {
+	account := testAccount("cooldown", true, AccountReady, testChatModel("gemini-flash-latest"))
+	account.runtime.Cooldowns = map[string]CooldownState{
+		globalCooldownKey: {Until: time.Now().Add(80 * time.Millisecond), Reason: "rate limited"},
+	}
+	pool := NewAccountPool([]*Account{account}, 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lease, err := pool.AcquireFor(ctx, AccountSelection{ModelID: "gemini-flash-latest"})
+	if err != nil {
+		t.Fatalf("冷却结束后获取租约失败: %v", err)
+	}
+	if lease.Account().ID != "cooldown" {
+		t.Fatalf("应获得冷却账户,实际 %s", lease.Account().ID)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatalf("释放租约失败: %v", err)
+	}
+}
+
+// TestAcquireForConcurrentDuringCooldown 在 -race 下验证
+// 冷却等待与并发唤醒路径的锁配对:多个等待者同时醒来抢租约,
+// 冷却窗口过后应全部成功完成获取-释放循环且无数据竞争。
+func TestAcquireForConcurrentDuringCooldown(t *testing.T) {
+	accounts := []*Account{
+		testAccount("a1", true, AccountReady, testChatModel("gemini-flash-latest")),
+		testAccount("a2", true, AccountReady, testChatModel("gemini-flash-latest")),
+	}
+	for _, account := range accounts {
+		account.runtime.Cooldowns = map[string]CooldownState{
+			globalCooldownKey: {Until: time.Now().Add(60 * time.Millisecond), Reason: "rate limited"},
+		}
+	}
+	pool := NewAccountPool(accounts, 1)
+
+	const waiters = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, waiters)
+	for range waiters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			lease, err := pool.AcquireFor(ctx, AccountSelection{ModelID: "gemini-flash-latest"})
+			if err != nil {
+				errs <- fmt.Errorf("获取租约失败: %w", err)
+				return
+			}
+			if err := lease.Release(); err != nil {
+				errs <- fmt.Errorf("释放租约失败: %w", err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+// TestMarkModelAccessVerifiedFreshness 验证资格标记节流窗口:
+// 模型键与全局键均已 verified 且无待清理冷却时,窗口内的
+// checkedAt 推进不应触发任何状态变更(快路径直接返回),
+// 窗口外或存在冷却时必须正常落盘清除冷却并推进时间戳。
+func TestMarkModelAccessVerifiedFreshness(t *testing.T) {
+	account := testAccount("a1", true, AccountReady, testChatModel("model-a"))
+	now := time.Now().UTC()
+	stampBoth := func(at time.Time) {
+		account.runtime.ModelAccess = map[string]ModelAccess{
+			"model-a":         {State: ModelAccessVerified, CheckedAt: at},
+			globalCooldownKey: {State: ModelAccessVerified, CheckedAt: at},
+		}
+	}
+
+	// 窗口内:快路径,内存时间戳不应被推进
+	stampBoth(now.Add(-time.Minute))
+	pool := NewAccountPool([]*Account{account}, 2)
+	changed, err := pool.MarkModelAccessVerifiedIfGeneration("a1", "model-a", account.modelAccessGeneration, now)
+	if changed {
+		t.Errorf("窗口内标记不应报告状态变更")
+	}
+	if !account.runtime.ModelAccess["model-a"].CheckedAt.Equal(now.Add(-time.Minute)) {
+		t.Fatalf("窗口内快路径不应推进 CheckedAt")
+	}
+
+	// 窗口外:必须真正写回
+	stampBoth(now.Add(-modelAccessFreshness - time.Minute))
+	changed, err = pool.MarkModelAccessVerifiedIfGeneration("a1", "model-a", account.modelAccessGeneration, now)
+	if err != nil {
+		t.Fatalf("窗口外标记失败: %v", err)
+	}
+	if account.runtime.ModelAccess["model-a"].CheckedAt.Before(now.Add(-time.Second)) {
+		t.Errorf("窗口外应推进 CheckedAt,实际 %v", account.runtime.ModelAccess["model-a"].CheckedAt)
+	}
+
+	// 存在冷却时:即使在窗口内也必须清除冷却(保留原语义)
+	account.runtime.Cooldowns = map[string]CooldownState{
+		"model-a": {Until: now.Add(time.Hour), Reason: "quota"},
+	}
+	account.runtime.ModelAccess["model-a"] = ModelAccess{State: ModelAccessVerified, CheckedAt: now}
+	if _, err = pool.MarkModelAccessVerifiedIfGeneration("a1", "model-a", account.modelAccessGeneration, now); err != nil {
+		t.Fatalf("带冷却标记失败: %v", err)
+	}
+	if _, exists := account.runtime.Cooldowns["model-a"]; exists {
+		t.Errorf("标记后模型冷却应被清除")
+	}
+}
+
+// TestAcquireForCooldownTimerSurvivesSpuriousWake 验证快筛等待路径
+// 不会丢失冷却到期定时器:等待期间若被无关广播唤醒(快筛无可
+// 获取候选后回睡),冷却到期仍应由定时器唤醒并成功获取,
+// 而不是无限等待下一次广播。
+func TestAcquireForCooldownTimerSurvivesSpuriousWake(t *testing.T) {
+	cooled := testAccount("cooled", true, AccountReady, testChatModel("gemini-flash-latest"))
+	cooled.runtime.Cooldowns = map[string]CooldownState{
+		globalCooldownKey: {Until: time.Now().Add(150 * time.Millisecond), Reason: "rate limited"},
+	}
+	// 无关账户:其状态变化会广播,但对本选择不可获取
+	unrelated := testAccount("unrelated", true, AccountReady, testChatModel("other-model"))
+	pool := NewAccountPool([]*Account{cooled, unrelated}, 2)
+
+	acquired := make(chan *AccountLease, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		lease, err := pool.AcquireFor(ctx, AccountSelection{ModelID: "gemini-flash-latest"})
+		if err != nil {
+			t.Errorf("冷却结束后应获取成功: %v", err)
+			close(acquired)
+			return
+		}
+		acquired <- lease
+	}()
+
+	// 冷却期间制造多次无关广播
+	time.Sleep(30 * time.Millisecond)
+	for range 3 {
+		if err := pool.setAccountState("unrelated", AccountReady, "ping"); err != nil {
+			t.Fatalf("制造广播失败: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	select {
+	case lease := <-acquired:
+		if lease == nil {
+			t.Fatalf("未获取到租约")
+		}
+		if lease.Account().ID != "cooled" {
+			t.Fatalf("应获得冷却结束账户,实际 %s", lease.Account().ID)
+		}
+		if err := lease.Release(); err != nil {
+			t.Fatalf("释放租约失败: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("冷却到期后未被定时器唤醒(丢失唤醒)")
+	}
+}
+
+// TestScreenCandidateMatchesAcquire 验证快筛与真实获取判定一致:
+// 存在可获取候选时快筛必须放行,全部忙/冷却时必须拦下。
+func TestScreenCandidateMatchesAcquire(t *testing.T) {
+	busy := testAccount("busy", true, AccountReady, testChatModel("gemini-flash-latest"))
+	pool := NewAccountPool([]*Account{busy}, 1)
+
+	lease, err := pool.AcquireFor(context.Background(), AccountSelection{})
+	if err != nil {
+		t.Fatalf("获取租约失败: %v", err)
+	}
+	// 单账户满载:快筛应判定无可获取候选
+	if _, acquirable, _ := pool.screenCandidate(AccountSelection{}, time.Now()); acquirable {
+		t.Errorf("满载时快筛不应放行")
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatalf("释放租约失败: %v", err)
+	}
+	if _, acquirable, _ := pool.screenCandidate(AccountSelection{}, time.Now()); !acquirable {
+		t.Errorf("释放后快筛应放行")
+	}
+}

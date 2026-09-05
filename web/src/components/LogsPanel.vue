@@ -1,18 +1,19 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
+import { formatClockTime } from '@/format'
 import { useI18n } from '@/i18n'
-import type { AdminLog } from '@/types'
+import type { LogEntry } from '@/types'
 import UiIcon from './UiIcon.vue'
 
 const props = defineProps<{
-  logs: AdminLog[]
+  logs: LogEntry[]
 }>()
 
 defineEmits<{
   clear: []
 }>()
 
-const { t } = useI18n()
+const { locale, t } = useI18n()
 const level = ref<'ALL' | 'INFO' | 'WARN' | 'ERROR'>('ALL')
 const source = ref('ALL')
 const autoScroll = ref(true)
@@ -30,12 +31,28 @@ const sources = computed(() =>
   Array.from(new Set(props.logs.map((entry) => entry.source).filter(Boolean))).sort(),
 )
 
-const filteredLogs = computed(() =>
-  props.logs.filter(
-    (entry) =>
-      (level.value === 'ALL' || entry.level.toUpperCase() === level.value) &&
-      (source.value === 'ALL' || entry.source === source.value),
-  ),
+// viewLogs 预先归一化 level 并计算展示文案:模板内每行不再
+// 重复 toUpperCase(此前每行每次渲染调用 4 次,高吞吐时显著浪费)
+interface ViewLog extends LogEntry {
+  normalizedLevel: string
+  levelText: string
+}
+
+const viewLogs = computed<ViewLog[]>(() =>
+  props.logs
+    .filter(
+      (entry) =>
+        (level.value === 'ALL' || entry.level.toUpperCase() === level.value) &&
+        (source.value === 'ALL' || entry.source === source.value),
+    )
+    .map((entry) => {
+      const normalizedLevel = entry.level.toUpperCase()
+      return {
+        ...entry,
+        normalizedLevel,
+        levelText: displayLevel(normalizedLevel),
+      }
+    }),
 )
 
 const logGridStyle = computed(() => ({ '--log-source-width': `${sourceWidth.value}px` }))
@@ -65,8 +82,7 @@ function scrollToBottom(): void {
 }
 
 function displayTime(value: string): string {
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString('en-GB', { hour12: false })
+  return formatClockTime(value, locale.value)
 }
 
 function clampSourceWidth(value: number): number {
@@ -159,12 +175,12 @@ watch(autoScroll, scrollToBottom)
           :class="
             autoScroll
               ? 'border-blue-500/30 bg-blue-500/10 text-blue-400'
-              : 'border-gray-700 text-gray-500'
+              : 'border-gray-700 text-gray-400'
           "
           type="button"
           @click="autoScroll = !autoScroll"
         >
-          {{ t('logs.autoScroll') }}: {{ autoScroll ? 'ON' : 'OFF' }}
+          {{ t('logs.autoScroll') }}: {{ autoScroll ? t('common.on') : t('common.off') }}
         </button>
       </div>
     </div>
@@ -173,7 +189,7 @@ watch(autoScroll, scrollToBottom)
       ref="output"
       class="min-h-0 flex-1 overflow-auto bg-[#0d1117] p-2 font-mono text-[13px] leading-5"
     >
-      <div v-if="filteredLogs.length === 0" class="mt-10 text-center text-gray-600 italic">
+      <div v-if="viewLogs.length === 0" class="mt-10 text-center text-gray-400 italic">
         {{ t('logs.waiting') }}
       </div>
       <div v-else class="log-table" :style="logGridStyle">
@@ -194,22 +210,21 @@ watch(autoScroll, scrollToBottom)
           @keydown="resizeSourceWithKeyboard"
         ></div>
         <div
-          v-for="(entry, index) in filteredLogs"
-          :key="`${entry.time}:${index}`"
+          v-for="entry in viewLogs"
+          :key="entry.id"
           class="log-entry log-grid border-l-2 px-2 py-0.5 select-text"
           :class="{
-            'border-blue-500 text-gray-300': entry.level.toUpperCase() === 'INFO',
-            'border-yellow-500 bg-yellow-500/5 text-yellow-100':
-              entry.level.toUpperCase() === 'WARN',
-            'border-red-500 bg-red-500/10 text-red-100': entry.level.toUpperCase() === 'ERROR',
+            'border-blue-500 text-gray-300': entry.normalizedLevel === 'INFO',
+            'border-yellow-500 bg-yellow-500/5 text-yellow-100': entry.normalizedLevel === 'WARN',
+            'border-red-500 bg-red-500/10 text-red-100': entry.normalizedLevel === 'ERROR',
             'border-gray-600 text-gray-300': !['INFO', 'WARN', 'ERROR'].includes(
-              entry.level.toUpperCase(),
+              entry.normalizedLevel,
             ),
           }"
         >
-          <span class="text-right text-gray-600">{{ displayTime(entry.time) }}</span>
-          <span class="font-semibold">{{ displayLevel(entry.level) }}</span>
-          <span class="log-cell log-source text-gray-500" :title="entry.source">{{
+          <span class="text-right text-gray-400">{{ displayTime(entry.time) }}</span>
+          <span class="font-semibold">{{ entry.levelText }}</span>
+          <span class="log-cell log-source text-gray-400" :title="entry.source">{{
             entry.source
           }}</span>
           <span class="log-cell log-message">{{ entry.message }}</span>
@@ -220,16 +235,26 @@ watch(autoScroll, scrollToBottom)
 </template>
 
 <style scoped>
+/* 列宽常量集中在 .log-table,拖拽把手定位与最小宽度
+均从同一组变量推导,消除三处独立手算导致的漂移 */
 .log-table {
+  --log-time-col: 5rem;
+  --log-level-col: 3.5rem;
+  --log-message-min: 32rem;
+  --log-gap: 0.75rem;
   position: relative;
   width: 100%;
-  min-width: calc(43.875rem + var(--log-source-width));
+  min-width: calc(
+    var(--log-time-col) + var(--log-level-col) + var(--log-message-min) + 3 * var(--log-gap) +
+      var(--log-source-width)
+  );
 }
 
 .log-grid {
   display: grid;
-  grid-template-columns: 5rem 3.5rem var(--log-source-width) minmax(32rem, 1fr);
-  column-gap: 0.75rem;
+  grid-template-columns: var(--log-time-col) var(--log-level-col) var(--log-source-width)
+    minmax(var(--log-message-min), 1fr);
+  column-gap: var(--log-gap);
   align-items: start;
 }
 
@@ -244,7 +269,10 @@ watch(autoScroll, scrollToBottom)
   z-index: 10;
   top: 0;
   bottom: 0;
-  left: calc(10.5rem + var(--log-source-width) + 2px);
+  left: calc(
+    var(--log-time-col) + var(--log-gap) + var(--log-level-col) + var(--log-gap) +
+      var(--log-source-width) - 0.375rem
+  );
   width: 0.75rem;
   cursor: col-resize;
   touch-action: none;

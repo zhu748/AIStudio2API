@@ -27,7 +27,7 @@ const props = withDefaults(
 
 const aliases: Partial<Record<IconName, keyof typeof legacyIcons>> = {
   accounts: 'key',
-  models: 'dashboard',
+  models: 'collection',
   requests: 'info',
   playground: 'chat',
   plus: 'info',
@@ -35,7 +35,7 @@ const aliases: Partial<Record<IconName, keyof typeof legacyIcons>> = {
   verify: 'check',
   save: 'check',
   send: 'play',
-  copy: 'dashboard',
+  copy: 'collection',
   eye: 'info',
   'eye-off': 'close',
 }

@@ -529,3 +529,32 @@ type responsesReasoningDeltaOut struct {
 	SummaryIndex   int    `json:"summary_index"`
 	Delta          string `json:"delta"`
 }
+
+// responsesShellEventOut 对应 response.created / response.in_progress
+// 每请求双帧:负载为完整 response shell(含 tools 大 schema),
+// 两帧内容一致仅序号不同,调用方复用同一 shell 只推进 sequence。
+type responsesShellEventOut struct {
+	Type           string         `json:"type"`
+	SequenceNumber int            `json:"sequence_number"`
+	Response       map[string]any `json:"response"`
+}
+
+// responsesFunctionCallDeltaOut 对应 response.function_call_arguments.delta
+// 帧:arguments 为完整工具调用 JSON,可能为大 payload 帧。
+type responsesFunctionCallDeltaOut struct {
+	Type           string `json:"type"`
+	SequenceNumber int    `json:"sequence_number"`
+	ItemID         string `json:"item_id"`
+	OutputIndex    int    `json:"output_index"`
+	Delta          string `json:"delta"`
+}
+
+// responsesFunctionCallDoneOut 对应 response.function_call_arguments.done 帧
+type responsesFunctionCallDoneOut struct {
+	Type           string `json:"type"`
+	SequenceNumber int    `json:"sequence_number"`
+	ItemID         string `json:"item_id"`
+	OutputIndex    int    `json:"output_index"`
+	Arguments      string `json:"arguments"`
+	Name           string `json:"name"`
+}

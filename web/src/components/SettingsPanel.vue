@@ -1,9 +1,22 @@
 <script setup lang="ts">
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { api } from '@/api'
 import { useI18n } from '@/i18n'
+import { proxySchemeError } from '@/proxy'
 import type { ServiceConfig } from '@/types'
 import UiIcon from './UiIcon.vue'
+
+// durationError 检查 Go duration 格式(如 90s、2m、1h30m);
+// 纯数字(如 “120”)在 Go 中也是合法的纳秒,但几乎必为用户笔误,
+// 一并拦截并提示带单位书写
+const durationPattern = /^(\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+$/
+
+function durationError(value: string): boolean {
+  const trimmed = value.trim()
+  if (trimmed === '') return true
+  if (/^\d+$/.test(trimmed)) return true
+  return !durationPattern.test(trimmed)
+}
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -36,6 +49,29 @@ const form = reactive<ServiceConfig>({
   per_account_concurrency: 2,
   temporary_chat: false,
 })
+
+// 代理/时长客户端校验:与服务端 ValidateProxy 及 Go duration
+// 解析规则对齐,提交前拦截常见错误,字段旁内联提示
+const proxyError = computed(() => {
+  const code = proxySchemeError(form.proxy)
+  if (code === '') return ''
+  if (code === 'scheme') return t('common.proxyInvalidScheme')
+  return t('common.proxyInvalid')
+})
+const initTimeoutError = computed(() =>
+  durationError(form.init_timeout) ? t('settings.durationHint') : '',
+)
+const requestTimeoutError = computed(() =>
+  durationError(form.request_timeout) ? t('settings.durationHint') : '',
+)
+const formValid = computed(
+  () =>
+    proxyError.value === '' &&
+    initTimeoutError.value === '' &&
+    requestTimeoutError.value === '' &&
+    form.init_timeout.trim() !== '' &&
+    form.request_timeout.trim() !== '',
+)
 
 watch(
   () => props.config,
@@ -78,7 +114,7 @@ async function saveConfig(): Promise<void> {
     <div v-if="error" class="rounded border border-red-500/40 bg-red-500/10 p-4 text-red-300">
       {{ error }}
     </div>
-    <div v-else-if="loading || config === null" class="py-12 text-center text-gray-500">
+    <div v-else-if="loading || config === null" class="py-12 text-center text-gray-400">
       {{ t('common.loading') }}
     </div>
     <form v-else class="space-y-6" @submit.prevent="saveConfig">
@@ -106,12 +142,6 @@ async function saveConfig(): Promise<void> {
             required
             autocomplete="off"
           />
-          <span
-            v-if="form.listen_addr !== config.active_listen_addr"
-            class="mt-1 block text-xs text-gray-500"
-          >
-            {{ t('settings.activeValue') }}: {{ config.active_listen_addr }}
-          </span>
         </label>
         <label class="block">
           <span class="mb-1 block text-sm font-medium text-gray-400">{{
@@ -123,6 +153,12 @@ async function saveConfig(): Promise<void> {
             required
             autocomplete="off"
           />
+          <span
+            v-if="form.listen_addr !== config.active_listen_addr"
+            class="mt-1 block text-xs text-gray-400"
+          >
+            {{ t('settings.activeValue') }}: {{ config.active_listen_addr }}
+          </span>
         </label>
       </div>
 
@@ -148,7 +184,7 @@ async function saveConfig(): Promise<void> {
           </div>
           <span
             v-if="form.proxy_api_key !== config.active_proxy_api_key"
-            class="mt-1 block text-xs text-gray-500"
+            class="mt-1 block text-xs text-gray-400"
           >
             {{ t('settings.activeValue') }}:
             {{ revealKey ? config.active_proxy_api_key || t('common.empty') : '••••••••' }}
@@ -163,10 +199,22 @@ async function saveConfig(): Promise<void> {
           }}</span>
           <input
             v-model.trim="form.proxy"
-            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            class="w-full rounded border px-3 py-2 text-white transition focus:outline-none"
+            :class="
+              proxyError !== ''
+                ? 'border-red-500/60 bg-[#0d1117] focus:border-red-500'
+                : 'border-[#30363d] bg-[#0d1117] focus:border-blue-500'
+            "
             placeholder="http://127.0.0.1:7890"
             autocomplete="off"
+            spellcheck="false"
           />
+          <span v-if="proxyError !== ''" class="mt-1 block text-xs text-red-400">
+            {{ proxyError }}
+          </span>
+          <span v-else class="mt-1 block text-xs text-gray-400">
+            {{ t('settings.proxyHint') }}
+          </span>
         </label>
       </div>
 
@@ -177,10 +225,22 @@ async function saveConfig(): Promise<void> {
           }}</span>
           <input
             v-model.trim="form.init_timeout"
-            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            class="w-full rounded border px-3 py-2 text-white transition focus:outline-none"
+            :class="
+              initTimeoutError !== ''
+                ? 'border-red-500/60 bg-[#0d1117] focus:border-red-500'
+                : 'border-[#30363d] bg-[#0d1117] focus:border-blue-500'
+            "
+            placeholder="2m"
             required
             autocomplete="off"
           />
+          <span
+            class="mt-1 block text-xs"
+            :class="initTimeoutError !== '' ? 'text-red-400' : 'text-gray-400'"
+          >
+            {{ initTimeoutError !== '' ? initTimeoutError : t('settings.durationHint') }}
+          </span>
         </label>
         <label class="block">
           <span class="mb-1 block text-sm font-medium text-gray-400">{{
@@ -188,10 +248,22 @@ async function saveConfig(): Promise<void> {
           }}</span>
           <input
             v-model.trim="form.request_timeout"
-            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            class="w-full rounded border px-3 py-2 text-white transition focus:outline-none"
+            :class="
+              requestTimeoutError !== ''
+                ? 'border-red-500/60 bg-[#0d1117] focus:border-red-500'
+                : 'border-[#30363d] bg-[#0d1117] focus:border-blue-500'
+            "
+            placeholder="5m"
             required
             autocomplete="off"
           />
+          <span
+            class="mt-1 block text-xs"
+            :class="requestTimeoutError !== '' ? 'text-red-400' : 'text-gray-400'"
+          >
+            {{ requestTimeoutError !== '' ? requestTimeoutError : t('settings.durationHint') }}
+          </span>
         </label>
       </div>
 
@@ -256,7 +328,7 @@ async function saveConfig(): Promise<void> {
         <button
           class="flex items-center gap-2 rounded bg-blue-600 px-6 py-2 font-medium text-white shadow-lg transition hover:bg-blue-500 disabled:opacity-50"
           type="submit"
-          :disabled="saving"
+          :disabled="saving || !formValid"
         >
           <UiIcon :name="saving ? 'spinner' : 'check'" :size="16" />
           {{ saving ? t('common.loading') : t('common.save') }}

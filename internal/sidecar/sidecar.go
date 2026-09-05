@@ -65,6 +65,10 @@ func (p *sidecarProcess) alive() bool {
 var (
 	registryMu sync.Mutex
 	registry   = make(map[string]*sidecarProcess)
+	// pending 记录正在启动中的链接:同一链接并发 Ensure 只允许
+	// 一个启动者,其余调用方等待其完成后直接复用结果,避免竞态下
+	// 拉起重复的 sing-box 进程(先启动者被覆盖后无人回收,泄漏到进程退出)。
+	pending = make(map[string]chan struct{})
 )
 
 // Ensure 返回分享链接对应的本地 SOCKS5 代理地址。
@@ -76,7 +80,8 @@ var (
 //     socks5://127.0.0.1:<port>
 //
 // 进程已死时自动重建(端口可能变化);启动失败重试 3 次
-// (覆盖本地端口竞争窗口)。
+// (覆盖本地端口竞争窗口)。同一链接的并发启动由 pending
+// 单飞互斥,等待方在启动者完成后复用同一进程。
 func Ensure(raw string) (string, error) {
 	outbound, err := proxyproto.Parse(raw)
 	if err != nil {
@@ -87,41 +92,77 @@ func Ensure(raw string) (string, error) {
 		return raw, nil
 	}
 	key := outbound.Raw()
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		registryMu.Lock()
-		process := registry[key]
-		registryMu.Unlock()
-		if process != nil {
-			process.mu.Lock()
-			alive := process.alive()
-			address := process.socksURL()
-			process.mu.Unlock()
-			if alive {
-				return address, nil
-			}
-			// 已死:清理并移除注册表,走新建路径
-			registryMu.Lock()
-			if registry[key] == process {
-				delete(registry, key)
-			}
-			registryMu.Unlock()
-			process.mu.Lock()
-			process.stopLocked()
-			process.mu.Unlock()
-			lastErr = fmt.Errorf("sing-box 进程此前已退出(%s): %s", process.node.Type, process.stderr.tail(2048))
-		}
-		process, startErr := startProcess(key, outbound.Sidecar())
-		if startErr != nil {
-			lastErr = startErr
-			continue
-		}
-		registryMu.Lock()
-		registry[key] = process
-		registryMu.Unlock()
-		return process.socksURL(), nil
+	if process := lookupAliveSidecar(key); process != nil {
+		return sidecarAddress(process), nil
 	}
-	return "", fmt.Errorf("sing-box 转换层启动失败(%s): %w", outbound.Sidecar().Type, lastErr)
+	// 单飞:已有并发调用方在启动同一链接,等它完成后直接复用
+	registryMu.Lock()
+	if done, exists := pending[key]; exists {
+		registryMu.Unlock()
+		<-done
+		if process := lookupAliveSidecar(key); process != nil {
+			return sidecarAddress(process), nil
+		}
+		return "", fmt.Errorf("sing-box 并发启动未成功(%s),请重试", outbound.Sidecar().Type)
+	}
+	done := make(chan struct{})
+	pending[key] = done
+	registryMu.Unlock()
+
+	var (
+		process  *sidecarProcess
+		startErr error
+	)
+	for attempt := 0; attempt < 3 && process == nil; attempt++ {
+		process, startErr = startProcess(key, outbound.Sidecar())
+	}
+	registryMu.Lock()
+	delete(pending, key)
+	if process != nil {
+		registry[key] = process
+	}
+	close(done)
+	registryMu.Unlock()
+	if process == nil {
+		return "", fmt.Errorf("sing-box 转换层启动失败(%s): %w", outbound.Sidecar().Type, startErr)
+	}
+	return sidecarAddress(process), nil
+}
+
+// lookupAliveSidecar 返回 key 对应的存活进程;进程已死时
+// 从注册表移除、清理配置文件并记录诊断日志,返回 nil。
+func lookupAliveSidecar(key string) *sidecarProcess {
+	registryMu.Lock()
+	process := registry[key]
+	registryMu.Unlock()
+	if process == nil {
+		return nil
+	}
+	process.mu.Lock()
+	alive := process.alive()
+	process.mu.Unlock()
+	if alive {
+		return process
+	}
+	// 已死:清理并移除注册表,走新建路径
+	registryMu.Lock()
+	if registry[key] == process {
+		delete(registry, key)
+	}
+	registryMu.Unlock()
+	process.mu.Lock()
+	process.stopLocked()
+	process.mu.Unlock()
+	slog.Warn("sing-box 转换层进程已退出,下次 Ensure 将重建",
+		"protocol", process.node.Type, "node", process.node.Tag, "stderr", process.stderr.tail(2048))
+	return nil
+}
+
+// sidecarAddress 在进程锁内读取本地 SOCKS5 地址。
+func sidecarAddress(process *sidecarProcess) string {
+	process.mu.Lock()
+	defer process.mu.Unlock()
+	return process.socksURL()
 }
 
 // startProcess 拉起一个新的 sing-box 子进程并等待就绪

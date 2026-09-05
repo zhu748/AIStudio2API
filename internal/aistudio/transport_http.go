@@ -47,8 +47,6 @@ type MakerSuiteHTTPTransport struct {
 	headers     ProtocolHeaderProvider
 	globalProxy string
 	now         func() time.Time
-	clientsMu   sync.Mutex
-	clients     map[string]*http.Client
 }
 
 type accountLeaseContextKey struct{}
@@ -95,9 +93,9 @@ func NewMakerSuiteHTTPTransport(options HTTPTransportOptions) (*MakerSuiteHTTPTr
 		headers:     options.Headers,
 		globalProxy: strings.TrimSpace(options.GlobalProxy),
 		now:         time.Now,
-		clients:     make(map[string]*http.Client),
 	}
-	if _, err := transport.clientForProxy(transport.globalProxy); err != nil {
+	// 预热全局代理出口,在构造期提前暴露非法代理配置。
+	if _, err := SharedProxyHTTPClient(transport.globalProxy); err != nil {
 		return nil, err
 	}
 	return transport, nil
@@ -215,28 +213,58 @@ func (t *MakerSuiteHTTPTransport) Do(ctx context.Context, rpc RPCRequest) (*RPCR
 	return &RPCResponse{StatusCode: response.StatusCode, Header: response.Header.Clone(), Body: body}, nil
 }
 
-// CloseIdleConnections 关闭全部固定出口的空闲连接
-func (t *MakerSuiteHTTPTransport) CloseIdleConnections() {
-	t.clientsMu.Lock()
-	defer t.clientsMu.Unlock()
-	for _, client := range t.clients {
-		client.CloseIdleConnections()
-	}
-}
+// proxyClientCache 按代理地址全局共享 HTTP 客户端(连接池),
+// 供 RPC 传输与账户公共头发现统一复用。
+var proxyClientCache = struct {
+	mu      sync.RWMutex
+	clients map[string]*http.Client
+}{mu: sync.RWMutex{}, clients: make(map[string]*http.Client)}
 
-func (t *MakerSuiteHTTPTransport) clientForProxy(proxyURL string) (*http.Client, error) {
+// SharedProxyHTTPClient 返回按代理 URL 全局共享的固定出口客户端。
+// 多账户共用同一代理(或全部跟随全局代理)时复用同一连接池,
+// 避免 N 个账户创建 N+1 套独立客户端导致 TCP/TLS 握手、
+// 空闲连接与文件描述符成倍放大。
+func SharedProxyHTTPClient(proxyURL string) (*http.Client, error) {
 	proxyURL = strings.TrimSpace(proxyURL)
-	t.clientsMu.Lock()
-	defer t.clientsMu.Unlock()
-	if client := t.clients[proxyURL]; client != nil {
+	proxyClientCache.mu.RLock()
+	client := proxyClientCache.clients[proxyURL]
+	proxyClientCache.mu.RUnlock()
+	if client != nil {
+		return client, nil
+	}
+	proxyClientCache.mu.Lock()
+	defer proxyClientCache.mu.Unlock()
+	if client = proxyClientCache.clients[proxyURL]; client != nil {
 		return client, nil
 	}
 	client, err := NewProxyHTTPClient(proxyURL)
 	if err != nil {
 		return nil, err
 	}
-	t.clients[proxyURL] = client
+	proxyClientCache.clients[proxyURL] = client
 	return client, nil
+}
+
+// CloseSharedProxyClients 关闭并清空全部共享客户端的空闲连接。
+// 服务停机或全局代理热更后调用;CloseIdleConnections 对仍在
+// 使用的共享客户端是安全建议性操作,连接会按需重建。
+func CloseSharedProxyClients() {
+	proxyClientCache.mu.Lock()
+	clients := proxyClientCache.clients
+	proxyClientCache.clients = make(map[string]*http.Client)
+	proxyClientCache.mu.Unlock()
+	for _, client := range clients {
+		client.CloseIdleConnections()
+	}
+}
+
+// CloseIdleConnections 关闭全部固定出口的空闲连接
+func (t *MakerSuiteHTTPTransport) CloseIdleConnections() {
+	CloseSharedProxyClients()
+}
+
+func (t *MakerSuiteHTTPTransport) clientForProxy(proxyURL string) (*http.Client, error) {
+	return SharedProxyHTTPClient(proxyURL)
 }
 
 func prepareProtocolHeaders(

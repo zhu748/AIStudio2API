@@ -48,10 +48,19 @@ function capabilityOptionEntries(model: Model): [string, string[]][] {
   )
 }
 
-// tokenLimit 使用当前界面语言格式化模型限制
+// tokenLimit 使用当前界面语言格式化模型限制。
+// Intl.NumberFormat 构造是最贵的一环,此前每格每次渲染新建
+// (~40 模型 × 2 格 × 搜索键入即整列重渲);按 locale 缓存复用。
+const numberFormatters = new Map<string, Intl.NumberFormat>()
+
 function tokenLimit(value: number | undefined): string {
   if (value === undefined || value === 0) return '—'
-  return new Intl.NumberFormat(locale.value).format(value)
+  let formatter = numberFormatters.get(locale.value)
+  if (formatter === undefined) {
+    formatter = new Intl.NumberFormat(locale.value)
+    numberFormatters.set(locale.value, formatter)
+  }
+  return formatter.format(value)
 }
 </script>
 
@@ -76,18 +85,18 @@ function tokenLimit(value: number | undefined): string {
         <option value="">{{ t('models.allMethods') }}</option>
         <option v-for="method in methods" :key="method" :value="method">{{ method }}</option>
       </select>
-      <span class="font-mono text-xs text-gray-500">{{ filteredModels.length }}</span>
+      <span class="font-mono text-xs text-gray-400">{{ filteredModels.length }}</span>
     </div>
 
     <div v-if="error" class="rounded border border-red-500/40 bg-red-500/10 p-4 text-red-300">
       {{ error }}
     </div>
-    <div v-else-if="loading" class="py-12 text-center text-gray-500">
+    <div v-else-if="loading" class="py-12 text-center text-gray-400">
       {{ t('common.loading') }}
     </div>
     <div
       v-else-if="filteredModels.length === 0"
-      class="rounded border border-[#30363d] bg-[#161b22] py-10 text-center text-gray-500"
+      class="rounded border border-[#30363d] bg-[#161b22] py-10 text-center text-gray-400"
     >
       {{ t('models.empty') }}
     </div>
@@ -112,7 +121,7 @@ function tokenLimit(value: number | undefined): string {
             </div>
             <code class="block truncate text-xs text-blue-400">{{ model.id }}</code>
           </div>
-          <div class="flex gap-4 text-right font-mono text-xs text-gray-500">
+          <div class="flex gap-4 text-right font-mono text-xs text-gray-400">
             <span>
               {{ t('models.context') }}
               <b class="block font-normal text-gray-300">{{
@@ -128,11 +137,11 @@ function tokenLimit(value: number | undefined): string {
           </div>
         </div>
         <div class="space-y-3 p-4">
-          <p v-if="model.description" class="text-xs leading-5 text-gray-500">
+          <p v-if="model.description" class="text-xs leading-5 text-gray-400">
             {{ model.description }}
           </p>
           <div>
-            <span class="mb-2 block text-xs text-gray-500">{{ t('models.methods') }}</span>
+            <span class="mb-2 block text-xs text-gray-400">{{ t('models.methods') }}</span>
             <div class="flex flex-wrap gap-2">
               <span
                 v-for="method in model.methods"
@@ -144,7 +153,7 @@ function tokenLimit(value: number | undefined): string {
             </div>
           </div>
           <div>
-            <span class="mb-2 block text-xs text-gray-500">{{ t('models.capabilities') }}</span>
+            <span class="mb-2 block text-xs text-gray-400">{{ t('models.capabilities') }}</span>
             <div class="flex flex-wrap gap-2">
               <span
                 v-for="capability in capabilityNames(model)"
@@ -153,11 +162,11 @@ function tokenLimit(value: number | undefined): string {
               >
                 {{ capability }}
               </span>
-              <span v-if="capabilityNames(model).length === 0" class="text-gray-600">—</span>
+              <span v-if="capabilityNames(model).length === 0" class="text-gray-400">—</span>
             </div>
             <div v-if="capabilityOptionEntries(model).length" class="mt-2 space-y-1 text-xs">
               <div v-for="[name, values] in capabilityOptionEntries(model)" :key="name">
-                <code class="text-gray-500">{{ name }}:</code>
+                <code class="text-gray-400">{{ name }}:</code>
                 <span class="ml-1 text-gray-400">{{ values.join(' / ') }}</span>
               </div>
             </div>

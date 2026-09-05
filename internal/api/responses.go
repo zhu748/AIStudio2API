@@ -685,10 +685,13 @@ func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request
 		w: w, id: id, created: created, request: request,
 		indexes: make(map[string]int), searchProbe: responsesUsesWebSearch(request.Tools),
 	}
-	if err := writer.emit("response.created", map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
+	// created/in_progress 双帧负载相同(仅序号不同):shell 只构建一次,
+	// 省掉 rawJSONValue 二次解析与 tools 大 schema 的二次拷贝。
+	shell := responseShell(id, created, "in_progress", request)
+	if err := writer.emitResponseShell("response.created", shell); err != nil {
 		return
 	}
-	if err := writer.emit("response.in_progress", map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
+	if err := writer.emitResponseShell("response.in_progress", shell); err != nil {
 		return
 	}
 	result, err := consumeStreamEvents(r.Context(), events, writer.live, func() error { return writeSSEHeartbeat(w) })
@@ -794,6 +797,37 @@ func (writer *responsesStreamWriter) emitReasoningDelta(itemID string, outputInd
 	return writeSSE(writer.w, "response.reasoning_summary_text.delta", payload)
 }
 
+// emitResponseShell 以 struct 信封序列化流起始双帧负载,绕过通用
+// map emit 的反射键排序;response shell 本身仍为 map(构建复杂度
+// 远低于序列化频率,维持可读性优先)。
+func (writer *responsesStreamWriter) emitResponseShell(eventType string, response map[string]any) error {
+	payload := responsesShellEventOut{
+		Type: eventType, SequenceNumber: writer.sequence, Response: response,
+	}
+	writer.sequence++
+	return writeSSE(writer.w, eventType, payload)
+}
+
+// emitFunctionCallArgumentsDelta/done 为大 payload 帧(arguments 为
+// 完整工具调用 JSON,一次整帧发出),struct 化避免 map 反射开销。
+func (writer *responsesStreamWriter) emitFunctionCallArgumentsDelta(itemID string, outputIndex int, arguments string) error {
+	payload := responsesFunctionCallDeltaOut{
+		Type: "response.function_call_arguments.delta", SequenceNumber: writer.sequence,
+		ItemID: itemID, OutputIndex: outputIndex, Delta: arguments,
+	}
+	writer.sequence++
+	return writeSSE(writer.w, "response.function_call_arguments.delta", payload)
+}
+
+func (writer *responsesStreamWriter) emitFunctionCallArgumentsDone(itemID string, outputIndex int, arguments string, name string) error {
+	payload := responsesFunctionCallDoneOut{
+		Type: "response.function_call_arguments.done", SequenceNumber: writer.sequence,
+		ItemID: itemID, OutputIndex: outputIndex, Arguments: arguments, Name: name,
+	}
+	writer.sequence++
+	return writeSSE(writer.w, "response.function_call_arguments.done", payload)
+}
+
 func (writer *responsesStreamWriter) flushPendingText() error {
 	writer.searchProbe = false
 	for _, text := range writer.pendingText {
@@ -873,14 +907,10 @@ func (writer *responsesStreamWriter) emitToolCall(call aistudio.FunctionCall) er
 		return err
 	}
 	arguments := string(call.Arguments)
-	if err := writer.emit("response.function_call_arguments.delta", map[string]any{
-		"item_id": id, "output_index": index, "delta": arguments,
-	}); err != nil {
+	if err := writer.emitFunctionCallArgumentsDelta(id, index, arguments); err != nil {
 		return err
 	}
-	if err := writer.emit("response.function_call_arguments.done", map[string]any{
-		"item_id": id, "output_index": index, "arguments": arguments, "name": call.Name,
-	}); err != nil {
+	if err := writer.emitFunctionCallArgumentsDone(id, index, arguments, call.Name); err != nil {
 		return err
 	}
 	return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": responseFunctionCall(call)})
@@ -892,7 +922,10 @@ func (writer *responsesStreamWriter) emitMedia(media aistudio.Media) error {
 		return err
 	}
 	writer.mediaCount++
-	id := completed["id"].(string)
+	id, ok := completed["id"].(string)
+	if !ok {
+		return fmt.Errorf("图片生成结果缺少 id 字段: %T", completed["id"])
+	}
 	index := len(writer.indexes)
 	writer.indexes[id] = index
 	inProgress := map[string]any{"id": id, "type": "image_generation_call", "status": "in_progress", "result": nil}

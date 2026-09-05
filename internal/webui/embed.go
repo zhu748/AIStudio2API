@@ -9,6 +9,15 @@ import (
 	"strings"
 )
 
+// 静态资源缓存策略:
+//   - vite 哈希产物(assets/*)内容不可变,允许浏览器一年强缓存;
+//   - index.html 与 SPA 回退入口必须每次协商,否则新版本发布后
+//     旧入口会继续引用已下线的旧哈希文件导致白屏。
+const (
+	immutableCacheControl = "public, max-age=31536000, immutable"
+	entryCacheControl     = "no-cache"
+)
+
 //go:embed dist
 var embedded embed.FS
 
@@ -58,6 +67,13 @@ func (handler *spaHandler) ServeHTTP(writer http.ResponseWriter, request *http.R
 		name = "index.html"
 	}
 	if _, err := fs.Stat(handler.files, name); err == nil {
+		// embed.FS 的 ModTime 为零值,http.FileServer 无法发出
+		// Last-Modified/304 协商缓存,改为显式 Cache-Control。
+		if strings.HasPrefix(name, "assets/") {
+			writer.Header().Set("Cache-Control", immutableCacheControl)
+		} else {
+			writer.Header().Set("Cache-Control", entryCacheControl)
+		}
 		handler.static.ServeHTTP(writer, request)
 		return
 	}
@@ -67,6 +83,7 @@ func (handler *spaHandler) ServeHTTP(writer http.ResponseWriter, request *http.R
 	}
 
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	writer.Header().Set("Cache-Control", entryCacheControl)
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write(handler.index)
 }

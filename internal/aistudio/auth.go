@@ -38,6 +38,20 @@ type StorageItem struct {
 	Value string `json:"value"`
 }
 
+// clone 返回携带独立 Cookies/Origins 底层数组的状态副本。
+// 值字段与 string 均不可变;extra 仅在序列化时只读共享。
+// 供磁盘读缓存返回调用方可安全原地修改的副本。
+func (s StorageState) clone() StorageState {
+	copied := s
+	if s.Cookies != nil {
+		copied.Cookies = append([]StateCookie(nil), s.Cookies...)
+	}
+	if s.Origins != nil {
+		copied.Origins = append([]StorageOrigin(nil), s.Origins...)
+	}
+	return copied
+}
+
 // StorageOrigin 表示 Playwright storage state 中的站点数据
 type StorageOrigin struct {
 	Origin       string        `json:"origin"`
@@ -158,8 +172,20 @@ func LoadStorageState(filePath string) (StorageState, error) {
 	return state, nil
 }
 
-// WriteStorageState 原子写回 Playwright storage state
+// WriteStorageState 原子写回 Playwright storage state(强制落盘)
 func WriteStorageState(filePath string, state StorageState) error {
+	return writeStorageState(filePath, state, true)
+}
+
+// WriteStorageStateFast 原子写回 storage state 但跳过 fsync。
+// 供租约内高频 Cookie 轮换使用:rename 保证原子性与进程崩溃后的页缓存
+// 可见性;仅断电场景可能回退到旧 Cookie,由浏览器重新认证兑底,
+// 换取每请求省去 1-5ms 的强制落盘。
+func WriteStorageStateFast(filePath string, state StorageState) error {
+	return writeStorageState(filePath, state, false)
+}
+
+func writeStorageState(filePath string, state StorageState, durable bool) error {
 	if err := state.Validate(); err != nil {
 		return err
 	}
@@ -168,7 +194,7 @@ func WriteStorageState(filePath string, state StorageState) error {
 		return fmt.Errorf("编码 storage state: %w", err)
 	}
 	data = append(data, '\n')
-	return atomicWriteFile(filePath, data, 0o600)
+	return writeFileAtomic(filePath, data, 0o600, durable)
 }
 
 // Validate 校验 storage state 的浏览器字段
@@ -409,6 +435,14 @@ func sameSiteText(value http.SameSite) string {
 }
 
 func atomicWriteFile(filePath string, data []byte, mode os.FileMode) error {
+	return writeFileAtomic(filePath, data, mode, true)
+}
+
+// writeFileAtomic 以临时文件+rename 原子替换目标内容。
+// durable 控制写入后是否 fsync:账户配置、登录态发布等必须断电不丢的
+// 写入传 true;Cookie 轮换等高频且可容忍断电回退的写入传 false。
+// rename 的原子性(读者要么看到旧文件要么看到完整新文件)不受影响。
+func writeFileAtomic(filePath string, data []byte, mode os.FileMode, durable bool) error {
 	target, err := filepath.Abs(filePath)
 	if err != nil {
 		return fmt.Errorf("解析文件路径: %w", err)
@@ -430,9 +464,11 @@ func atomicWriteFile(filePath string, data []byte, mode os.FileMode) error {
 		temporary.Close()
 		return fmt.Errorf("写入临时文件: %w", err)
 	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return fmt.Errorf("同步临时文件: %w", err)
+	if durable {
+		if err := temporary.Sync(); err != nil {
+			temporary.Close()
+			return fmt.Errorf("同步临时文件: %w", err)
+		}
 	}
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("关闭临时文件: %w", err)

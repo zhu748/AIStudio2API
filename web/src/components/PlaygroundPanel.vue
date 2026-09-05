@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, reactive, ref, watch } from 'vue'
 import { ApiError, runPlayground, type PlaygroundChunk } from '@/api'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
@@ -65,6 +65,7 @@ const result = reactive<PlaygroundResult>({
 const isRunning = ref(false)
 const outputMode = ref<'output' | 'raw'>('output')
 const copied = ref(false)
+let copiedTimer: number | undefined
 const hasRun = ref(false)
 const submittedPrompt = ref('')
 const submittedModel = ref('')
@@ -227,26 +228,80 @@ function stop(): void {
   controller?.abort()
 }
 
-// copyOutput 复制当前可见响应
+// copyOutput 复制当前可见响应;非安全上下文(如局域网 HTTP
+// 访问)下 navigator.clipboard 不可用,降级到隐藏 textarea +
+// execCommand,失败时不再抛出未捕获异常(D10)
 async function copyOutput(): Promise<void> {
-  await navigator.clipboard.writeText(visibleOutput.value)
-  copied.value = true
-  window.setTimeout(() => {
-    copied.value = false
-  }, 1200)
+  const text = visibleOutput.value
+  let success = false
+  if (navigator.clipboard !== undefined) {
+    try {
+      await navigator.clipboard.writeText(text)
+      success = true
+    } catch {
+      success = false
+    }
+  }
+  if (!success) {
+    const fallback = document.createElement('textarea')
+    fallback.value = text
+    fallback.style.position = 'fixed'
+    fallback.style.opacity = '0'
+    document.body.appendChild(fallback)
+    fallback.select()
+    try {
+      success = document.execCommand('copy')
+    } catch {
+      success = false
+    }
+    fallback.remove()
+  }
+  if (success) {
+    copied.value = true
+    if (copiedTimer !== undefined) window.clearTimeout(copiedTimer)
+    copiedTimer = window.setTimeout(() => {
+      copied.value = false
+      copiedTimer = undefined
+    }, 1200)
+  }
+}
+
+// prompt 自动增高:随内容在 42px–200px 间伸缩,
+// 发送后清空时回归单行高度(B11)
+const promptElement = ref<HTMLTextAreaElement>()
+
+function autoGrowPrompt(): void {
+  const element = promptElement.value
+  if (element === undefined) return
+  element.style.height = 'auto'
+  element.style.height = `${Math.min(element.scrollHeight, 200)}px`
+}
+
+watch(
+  () => form.prompt,
+  () => {
+    void nextTick(autoGrowPrompt)
+  },
+)
+
+// submitPrompt 支持 Ctrl/⌘+Enter 发送(macOS Cmd 原本无效)
+function submitPrompt(): void {
+  if (form.model === '' || form.prompt.trim() === '' || isRunning.value) return
+  void execute()
 }
 
 onUnmounted(() => {
   controller?.abort()
   clearMedia()
+  if (copiedTimer !== undefined) window.clearTimeout(copiedTimer)
 })
 </script>
 
 <template>
   <section class="flex min-h-0 flex-1 flex-col overflow-hidden md:flex-row">
-    <div class="flex min-w-0 flex-1 flex-col bg-[#0d1117]">
+    <div class="order-2 flex min-w-0 flex-1 flex-col bg-[#0d1117] md:order-1">
       <div class="flex-1 space-y-4 overflow-auto p-4">
-        <div v-if="!hasRun" class="flex h-full flex-col items-center justify-center text-gray-500">
+        <div v-if="!hasRun" class="flex h-full flex-col items-center justify-center text-gray-400">
           <UiIcon name="chatBubble" :size="64" />
           <p>{{ t('playground.waiting') }}</p>
         </div>
@@ -301,7 +356,7 @@ onUnmounted(() => {
               <pre v-else-if="result.text" class="font-sans whitespace-pre-wrap text-gray-200">{{
                 result.text
               }}</pre>
-              <span v-else-if="isRunning" class="animate-pulse text-gray-500">...</span>
+              <span v-else-if="isRunning" class="animate-pulse text-gray-400">...</span>
               <pre
                 v-else-if="result.raw && !hasOutput"
                 class="font-mono text-xs whitespace-pre-wrap text-red-300"
@@ -327,7 +382,7 @@ onUnmounted(() => {
                 <img
                   v-if="media.mime.startsWith('image/')"
                   :src="media.url"
-                  alt=""
+                  :alt="submittedPrompt || 'generated media'"
                   class="max-h-[560px] max-w-full rounded-md border border-[#30363d] object-contain"
                 />
                 <audio
@@ -345,7 +400,7 @@ onUnmounted(() => {
               </template>
             </div>
 
-            <div class="flex items-center justify-between gap-3 text-xs text-gray-600">
+            <div class="flex items-center justify-between gap-3 text-xs text-gray-400">
               <span>
                 {{ submittedModel }}
                 <template v-if="result.status"> · HTTP {{ result.status }}</template>
@@ -353,14 +408,14 @@ onUnmounted(() => {
               </span>
               <div class="flex gap-2">
                 <button
-                  class="rounded px-2 py-1 text-gray-500 hover:bg-[#30363d] hover:text-white"
+                  class="rounded px-2 py-1 text-gray-400 hover:bg-[#30363d] hover:text-white"
                   type="button"
                   @click="outputMode = outputMode === 'output' ? 'raw' : 'output'"
                 >
                   {{ outputMode === 'output' ? t('playground.raw') : t('playground.output') }}
                 </button>
                 <button
-                  class="rounded px-2 py-1 text-gray-500 hover:bg-[#30363d] hover:text-white"
+                  class="rounded px-2 py-1 text-gray-400 hover:bg-[#30363d] hover:text-white"
                   type="button"
                   :disabled="visibleOutput === ''"
                   @click="copyOutput"
@@ -376,10 +431,12 @@ onUnmounted(() => {
       <div class="border-t border-[#30363d] bg-[#161b22] p-4">
         <div class="mx-auto flex max-w-3xl gap-2">
           <textarea
+            ref="promptElement"
             v-model="form.prompt"
-            class="h-[42px] max-h-[200px] flex-1 resize-none rounded border border-[#30363d] bg-[#0d1117] p-2 text-sm text-white focus:border-blue-500 focus:outline-none"
-            :placeholder="t('playground.placeholder')"
-            @keydown.ctrl.enter.prevent="execute"
+            class="h-[42px] max-h-[200px] min-h-[42px] flex-1 resize-none rounded border border-[#30363d] bg-[#0d1117] p-2 text-sm text-white focus:border-blue-500 focus:outline-none"
+            :placeholder="t('playground.placeholderShortcut')"
+            @keydown.enter.meta.prevent="submitPrompt"
+            @keydown.enter.ctrl.prevent="submitPrompt"
           ></textarea>
           <button
             v-if="isRunning"
@@ -404,10 +461,10 @@ onUnmounted(() => {
     </div>
 
     <aside
-      class="flex max-h-[45%] w-full shrink-0 flex-col space-y-5 overflow-auto border-t border-[#30363d] bg-[#161b22] p-4 md:max-h-none md:w-64 md:border-t-0 md:border-l"
+      class="order-1 flex max-h-[45%] w-full shrink-0 flex-col space-y-5 overflow-auto border-t border-[#30363d] bg-[#161b22] p-4 md:order-2 md:max-h-none md:w-64 md:border-t-0 md:border-l"
     >
       <div>
-        <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+        <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
           t('playground.mode')
         }}</label>
         <select
@@ -421,13 +478,17 @@ onUnmounted(() => {
       </div>
 
       <div>
-        <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+        <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
           t('playground.model')
         }}</label>
         <select
           v-model="form.model"
-          class="w-full appearance-none rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none"
+          class="w-full appearance-none rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+          :disabled="availableModels.length === 0"
         >
+          <option v-if="availableModels.length === 0" :value="''" disabled>
+            {{ t('models.empty') }}
+          </option>
           <option v-for="model in availableModels" :key="model.id" :value="model.id">
             {{ model.name }}
           </option>
@@ -436,7 +497,7 @@ onUnmounted(() => {
 
       <template v-if="form.mode === 'text'">
         <div>
-          <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+          <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
             t('playground.protocol')
           }}</label>
           <select
@@ -450,7 +511,7 @@ onUnmounted(() => {
         </div>
 
         <div>
-          <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+          <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
             t('playground.reasoning')
           }}</label>
           <select
@@ -466,7 +527,7 @@ onUnmounted(() => {
         </div>
 
         <div>
-          <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+          <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
             t('playground.tool')
           }}</label>
           <select
@@ -483,7 +544,7 @@ onUnmounted(() => {
 
       <div v-else-if="form.mode === 'image'" class="space-y-4">
         <label class="block">
-          <span class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+          <span class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
             t('playground.imageSize')
           }}</span>
           <select
@@ -497,7 +558,7 @@ onUnmounted(() => {
           </select>
         </label>
         <label class="block">
-          <span class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+          <span class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
             t('playground.imageQuality')
           }}</span>
           <select
@@ -513,7 +574,7 @@ onUnmounted(() => {
       </div>
 
       <div v-else-if="form.mode === 'speech'">
-        <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+        <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
           t('playground.voice')
         }}</label>
         <select
@@ -525,7 +586,7 @@ onUnmounted(() => {
       </div>
 
       <div v-if="form.mode === 'text' || form.mode === 'speech'">
-        <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+        <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">{{
           t('playground.system')
         }}</label>
         <textarea
@@ -536,12 +597,12 @@ onUnmounted(() => {
       </div>
 
       <div>
-        <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">API</label>
+        <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">API</label>
         <code class="block break-all text-xs text-blue-400">{{ endpoint }}</code>
       </div>
 
       <div>
-        <label class="mb-2 block text-xs font-bold text-gray-500 uppercase">API Key</label>
+        <label class="mb-2 block text-xs font-bold text-gray-400 uppercase">API Key</label>
         <input
           v-model="form.apiKey"
           class="w-full rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-xs text-white"
@@ -550,7 +611,7 @@ onUnmounted(() => {
       </div>
 
       <label v-if="form.mode === 'text'" class="flex items-center justify-between">
-        <span class="text-xs font-bold text-gray-500 uppercase">{{ t('playground.stream') }}</span>
+        <span class="text-xs font-bold text-gray-400 uppercase">{{ t('playground.stream') }}</span>
         <input v-model="form.stream" class="h-4 w-4 accent-blue-600" type="checkbox" />
       </label>
 

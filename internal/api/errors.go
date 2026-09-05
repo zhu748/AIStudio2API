@@ -244,6 +244,9 @@ func writeGeminiError(w http.ResponseWriter, status int, statusName string, mess
 }
 
 func writeAdminError(w http.ResponseWriter, status int, code string, message string) {
+	// 与其余三个协议写入器保持一致:错误信息进访问日志,便于
+	// 管理界面请求列表统一展示失败原因。
+	setAccessLogResponseError(w, message)
 	writeJSON(w, status, map[string]any{"error": map[string]string{
 		"code":    code,
 		"message": message,

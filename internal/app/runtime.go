@@ -1460,14 +1460,15 @@ func (provider *accountHeaderProvider) Add(account *aistudio.Account) error {
 	if account == nil {
 		return fmt.Errorf("账户未初始化")
 	}
-	client, err := aistudio.NewProxyHTTPClient(account.EffectiveProxy(provider.globalProxy))
+	// 使用按代理共享的客户端:多账户共用同一代理时复用连接池,
+	// 避免每账户一套独立 TCP/TLS 出口。
+	client, err := aistudio.SharedProxyHTTPClient(account.EffectiveProxy(provider.globalProxy))
 	if err != nil {
 		return fmt.Errorf("创建账户 %s 的固定出口: %w", account.ID, err)
 	}
 	provider.mu.Lock()
 	defer provider.mu.Unlock()
 	if _, exists := provider.accounts[account.ID]; exists {
-		client.CloseIdleConnections()
 		return fmt.Errorf("账户固定出口已存在: %s", account.ID)
 	}
 	provider.accounts[account.ID] = &accountHeaderState{client: client}
@@ -1492,7 +1493,7 @@ func (provider *accountHeaderProvider) prepareUpdate(
 	if proxy == "" {
 		proxy = strings.TrimSpace(provider.globalProxy)
 	}
-	client, err := aistudio.NewProxyHTTPClient(proxy)
+	client, err := aistudio.SharedProxyHTTPClient(proxy)
 	if err != nil {
 		return nil, fmt.Errorf("创建账户 %s 的固定出口: %w", account.ID, err)
 	}
@@ -1507,20 +1508,21 @@ func (update *accountHeaderUpdate) Commit() {
 		return
 	}
 	update.provider.mu.Lock()
-	current := update.provider.accounts[update.accountID]
 	update.provider.accounts[update.accountID] = update.state
 	update.provider.mu.Unlock()
 	update.pending = false
-	current.client.CloseIdleConnections()
+	// client 为按代理全局共享(SharedProxyHTTPClient),连接生命周期
+	// 由 CloseSharedProxyClients 统一管理;此处不可关闭,否则会误杀
+	// 其他共用同代理账户的空闲连接。
 }
 
-// Discard 关闭未发布的账户固定出口
+// Discard 丢弃未发布的账户固定出口
 func (update *accountHeaderUpdate) Discard() {
 	if update == nil || !update.pending {
 		return
 	}
 	update.pending = false
-	update.state.client.CloseIdleConnections()
+	// 共享客户端同样不在此关闭(见 Commit 注释)。
 }
 
 // Remove 删除账户的固定出口
@@ -1534,19 +1536,17 @@ func (provider *accountHeaderProvider) Remove(accountID string) error {
 	if account == nil {
 		return fmt.Errorf("账户固定出口不存在: %s", accountID)
 	}
-	account.client.CloseIdleConnections()
+	// 共享客户端不随单账户移除关闭(见 Commit 注释)。
 	return nil
 }
 
 // Close 关闭全部账户固定出口
 func (provider *accountHeaderProvider) Close() {
 	provider.mu.Lock()
-	accounts := provider.accounts
 	provider.accounts = nil
 	provider.mu.Unlock()
-	for _, account := range accounts {
-		account.client.CloseIdleConnections()
-	}
+	// 共享客户端的空闲连接由 CloseSharedProxyClients 在服务停机
+	// 或全局代理热更时统一回收,这里仅解除引用。
 }
 
 // Invalidate 清除账户公共头并让下一次请求重新发现
@@ -3189,6 +3189,17 @@ func (service *trackedService) forwardEvents(
 	var outputTokens int64
 	var reasoningTokens int64
 	stalled := false
+	// 上报目标(模型/账号)去重:整条流几乎不变,避免每个事件
+	// 都重复取元数据互斥锁做两次 TrimSpace。
+	reportedTargetModel := modelID
+	reportedTargetLabel := accountLabel
+	reportTarget := func(model string) {
+		if model == reportedTargetModel {
+			return
+		}
+		reportedTargetModel = model
+		api.SetAccessLogTarget(requestCtx, model, reportedTargetLabel)
+	}
 	stallTimer := time.NewTimer(streamStallThreshold)
 	if !stallTimer.Stop() {
 		<-stallTimer.C
@@ -3303,7 +3314,7 @@ func (service *trackedService) forwardEvents(
 				reasoningTokens = event.Usage.ReasoningTokens
 			}
 		}
-		api.SetAccessLogTarget(requestCtx, event.ProviderModel, lease.Account().Config.Label)
+		reportTarget(strings.TrimPrefix(strings.TrimSpace(event.ProviderModel), "models/"))
 		if terminal {
 			continue
 		}

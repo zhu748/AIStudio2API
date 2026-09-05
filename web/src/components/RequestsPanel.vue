@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { api } from '@/api'
+import { formatDateTime } from '@/format'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type { Account, Cooldown, RequestState, RequestSummary } from '@/types'
 import UiIcon from './UiIcon.vue'
@@ -30,6 +31,16 @@ const requestStateKeys: Record<RequestState, TranslationKey> = {
   failed: 'state.failed',
 }
 
+// 请求状态色彩:与账户状态同一套语义(运行=蓝、完成=绿、
+// 失败=红、取消=灰),替换原来的无色文本(B6)
+const requestStateClasses: Record<RequestState, string> = {
+  queued: 'text-yellow-400',
+  running: 'text-blue-400',
+  completed: 'text-green-400',
+  cancelled: 'text-gray-400',
+  failed: 'text-red-400',
+}
+
 const activeCount = computed(
   () =>
     props.requests.filter((request) => request.state === 'queued' || request.state === 'running')
@@ -41,15 +52,9 @@ function accountLabel(id: string, label: string): string {
   return label || props.accounts.find((account) => account.id === id)?.label || '—'
 }
 
-// formatTime 根据当前语言显示请求时间
+// formatTime 根据当前语言显示请求时间(格式化器缓存复用)
 function formatTime(value: string): string {
-  return new Intl.DateTimeFormat(locale.value, {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  }).format(new Date(value))
+  return formatDateTime(value, locale.value)
 }
 
 // cancelRequest 停止活动请求并刷新摘要
@@ -68,15 +73,16 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
 
 <template>
   <section class="mx-auto w-full max-w-4xl flex-1 overflow-auto p-4 md:p-8">
-    <div class="mb-6 flex items-center justify-between border-b border-[#30363d] pb-2">
+    <div class="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-[#30363d] pb-2">
       <h2 class="text-2xl font-bold text-white">{{ t('section.requests.title') }}</h2>
       <button
-        class="flex items-center gap-1 rounded bg-blue-600 px-3 py-1.5 text-xs text-white transition hover:bg-blue-500"
+        class="flex items-center gap-1 rounded bg-blue-600 px-3 py-1.5 text-xs text-white transition hover:bg-blue-500 disabled:opacity-50"
         type="button"
+        :disabled="loading"
         @click="emit('refresh')"
       >
-        <UiIcon name="refresh" :size="13" />
-        {{ t('app.refresh') }}
+        <UiIcon :name="loading ? 'spinner' : 'refresh'" :size="13" />
+        {{ loading ? t('common.loading') : t('app.refresh') }}
       </button>
     </div>
 
@@ -84,7 +90,7 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
       <article class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <div class="mb-4 flex items-center justify-between">
           <h3 class="font-bold text-gray-300">{{ t('cooldowns.title') }}</h3>
-          <span class="font-mono text-xs text-gray-500">{{ cooldowns.length }}</span>
+          <span class="font-mono text-xs text-gray-400">{{ cooldowns.length }}</span>
         </div>
         <div
           v-if="cooldownError"
@@ -92,10 +98,10 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
         >
           {{ cooldownError }}
         </div>
-        <div v-else-if="loading" class="py-8 text-center text-gray-500">
+        <div v-else-if="loading" class="py-8 text-center text-gray-400">
           {{ t('common.loading') }}
         </div>
-        <div v-else-if="cooldowns.length === 0" class="py-8 text-center text-xs text-gray-600">
+        <div v-else-if="cooldowns.length === 0" class="py-8 text-center text-xs text-gray-400">
           {{ t('cooldowns.empty') }}
         </div>
         <div v-else class="space-y-3">
@@ -111,7 +117,7 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                 <strong class="block truncate text-sm text-gray-200">{{
                   cooldown.model_id
                 }}</strong>
-                <span class="text-xs text-gray-500">{{
+                <span class="text-xs text-gray-400">{{
                   accountLabel(cooldown.account_id, cooldown.account_label)
                 }}</span>
               </div>
@@ -119,7 +125,7 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                 {{ t('state.cooldown') }}
               </span>
             </div>
-            <div class="flex flex-wrap justify-between gap-2 p-3 text-xs text-gray-500">
+            <div class="flex flex-wrap justify-between gap-2 p-3 text-xs text-gray-400">
               <span class="min-w-0 break-words">{{ cooldown.reason || '—' }}</span>
               <span>{{ t('cooldowns.until') }}: {{ formatTime(cooldown.until) }}</span>
             </div>
@@ -130,7 +136,7 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
       <article class="overflow-hidden rounded-lg border border-[#30363d] bg-[#161b22]">
         <div class="flex items-center justify-between border-b border-[#30363d] px-4 py-3">
           <h3 class="font-bold text-gray-300">{{ t('requests.history') }}</h3>
-          <span class="text-xs text-green-400"> {{ t('requests.live') }}: {{ activeCount }} </span>
+          <span class="text-xs text-blue-400"> {{ t('requests.live') }}: {{ activeCount }} </span>
         </div>
         <div
           v-if="requestError"
@@ -138,10 +144,10 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
         >
           {{ requestError }}
         </div>
-        <div v-else-if="loading" class="py-8 text-center text-gray-500">
+        <div v-else-if="loading" class="py-8 text-center text-gray-400">
           {{ t('common.loading') }}
         </div>
-        <div v-else-if="requests.length === 0" class="py-8 text-center text-xs text-gray-600">
+        <div v-else-if="requests.length === 0" class="py-8 text-center text-xs text-gray-400">
           {{ t('requests.empty') }}
         </div>
         <div v-else class="space-y-1 p-2">
@@ -153,10 +159,12 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
             <div class="min-w-0 flex-1">
               <div class="flex min-w-0 items-center gap-2">
                 <strong class="truncate text-sm text-gray-300">{{ request.model }}</strong>
-                <span class="text-xs text-gray-500">{{ t(requestStateKeys[request.state]) }}</span>
+                <span class="text-xs font-medium" :class="requestStateClasses[request.state]">{{
+                  t(requestStateKeys[request.state])
+                }}</span>
               </div>
             </div>
-            <div class="text-right text-xs text-gray-500">
+            <div class="text-right text-xs text-gray-400">
               <span class="block">{{
                 accountLabel(request.account_id, request.account_label)
               }}</span>
@@ -166,10 +174,13 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
               v-if="request.state === 'queued' || request.state === 'running'"
               class="rounded border border-red-900/50 bg-red-900/30 px-3 py-1 text-xs text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
               type="button"
-              :disabled="cancelling !== ''"
+              :disabled="cancelling === request.id"
               @click="cancelRequest(request)"
             >
-              {{ t('requests.stop') }}
+              <span class="flex items-center gap-1">
+                <UiIcon v-if="cancelling === request.id" name="spinner" :size="11" />
+                {{ t('requests.stop') }}
+              </span>
             </button>
           </div>
         </div>

@@ -28,6 +28,11 @@ const (
 	externalLeasePoll = 100 * time.Millisecond
 	runtimeLockPoll   = 25 * time.Millisecond
 	runtimeLockLimit  = 2 * time.Second
+	// modelAccessFreshness 限定模型资格“已验证”时间戳的刷新频率:
+	// 每次成功生成都会带全新 checkedAt 回写(否则每次都触发
+	// 全量读盘+落盘+fsync),但 CheckedAt 并不参与调度决策,
+	// 只需保证调度与展示在窗口内不过度陈旧即可。
+	modelAccessFreshness = 5 * time.Minute
 )
 
 // AccountState 表示账户当前是否可调度
@@ -116,24 +121,32 @@ type ModelAccess struct {
 
 // Account 表示一个稳定目录对应的 AI Studio 账户
 type Account struct {
-	ID                    string        `json:"id"`
-	Directory             string        `json:"-"`
-	ConfigPath            string        `json:"-"`
-	StoragePath           string        `json:"-"`
-	RuntimePath           string        `json:"-"`
-	Config                AccountConfig `json:"config"`
-	StorageState          StorageState  `json:"-"`
-	Models                []Model       `json:"models,omitempty"`
-	BenefitTier           BenefitTier   `json:"benefit_tier"`
-	State                 AccountState  `json:"state"`
-	LastUsed              time.Time     `json:"last_used,omitempty"`
-	runtime               accountRuntimeState
-	active                int
-	exclusive             bool
-	authRefreshers        int
-	leaseLock             *flock.Flock
-	leasePath             string
-	storageMu             sync.Mutex
+	ID             string        `json:"id"`
+	Directory      string        `json:"-"`
+	ConfigPath     string        `json:"-"`
+	StoragePath    string        `json:"-"`
+	RuntimePath    string        `json:"-"`
+	Config         AccountConfig `json:"config"`
+	StorageState   StorageState  `json:"-"`
+	Models         []Model       `json:"models,omitempty"`
+	BenefitTier    BenefitTier   `json:"benefit_tier"`
+	State          AccountState  `json:"state"`
+	LastUsed       time.Time     `json:"last_used,omitempty"`
+	runtime        accountRuntimeState
+	active         int
+	exclusive      bool
+	authRefreshers int
+	leaseLock      *flock.Flock
+	leasePath      string
+	storageMu      sync.Mutex
+	// storageCache* 在 storageMu 保护下维护磁盘 storage state 的
+	// 解析缓存:按 (mtime,size) 短路重复读盘。租约存续期间本进程持有
+	// flock,磁盘不可能被外部进程修改;flock 释放后若外部写入导致
+	// mtime/size 变化,下一次 stat 不匹配即自动失效重读。
+	storageCache          StorageState
+	storageCacheModTime   time.Time
+	storageCacheSize      int64
+	storageCacheValid     bool
 	runtimeMu             sync.Mutex
 	persistenceLocked     bool
 	authGeneration        uint64
@@ -949,32 +962,98 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 		changed := p.changed
 		p.mu.Unlock()
 
+		if waitErr := p.waitForCandidate(ctx, changed, selection, earliest); waitErr != nil {
+			return nil, waitErr
+		}
+	}
+}
+
+// waitForCandidate 等待下一个可获取时机(广播唤醒或冷却到期)。
+// 被广播唤醒时先持读锁快筛:无可用候选则携带新通道与最新冷却
+// 截止时间直接回睡,避免饱和期每次广播都升级为写锁全池扫描;
+// 快筛无结论(疑似可获取或选择集异常)时返回让调用方走完整重试。
+func (p *AccountPool) waitForCandidate(
+	ctx context.Context,
+	changed <-chan struct{},
+	selection AccountSelection,
+	earliest time.Time,
+) error {
+	for {
 		if earliest.IsZero() {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ctx.Err()
 			case <-changed:
 			}
-			continue
-		}
-		delay := time.Until(earliest)
-		if delay <= 0 {
-			continue
-		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
+		} else {
+			delay := time.Until(earliest)
+			if delay <= 0 {
+				return nil
 			}
-			return nil, ctx.Err()
-		case <-changed:
-			if !timer.Stop() {
-				<-timer.C
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ctx.Err()
+			case <-changed:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-timer.C:
+				return nil
 			}
-		case <-timer.C:
 		}
+		next, acquirable, screenEarliest := p.screenCandidate(selection, time.Now())
+		if acquirable {
+			return nil
+		}
+		// 无可获取候选:携带新通道与快筛到的冷却截止继续等待,
+		// 冷却到期无广播时由定时器兜底唤醒。
+		changed = next
+		earliest = screenEarliest
 	}
+}
+
+// screenCandidate 在同一把读锁内原子地返回当前广播通道、
+// 是否存在疑似可获取的候选、以及仍在冷却的最早截止时间。
+// 与 tryAcquireLocked 的判定条件保持一致(不含跨进程 flock
+// 可见性,由完整重试路径兑底)。
+func (p *AccountPool) screenCandidate(
+	selection AccountSelection,
+	now time.Time,
+) (changed <-chan struct{}, acquirable bool, earliest time.Time) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	changed = p.changed
+	indices, err := p.selectionIndicesLocked(selection)
+	if err != nil {
+		// 选择集异常(如指定账户被移除):交由完整重试路径上报错误。
+		return changed, true, time.Time{}
+	}
+	for _, index := range indices {
+		account := p.accounts[index]
+		if account == nil || !account.Config.Enabled || account.State != AccountReady {
+			continue
+		}
+		if selection.ModelID != "" && !accountSupportsSelection(account, selection) {
+			continue
+		}
+		if account.exclusive || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency {
+			continue
+		}
+		if selection.ResourceID == "" {
+			if cooldown, active := accountCooldown(account, selectionAccessScope(selection), now); active {
+				if earliest.IsZero() || cooldown.Until.Before(earliest) {
+					earliest = cooldown.Until
+				}
+				continue
+			}
+		}
+		return changed, true, earliest
+	}
+	return changed, false, earliest
 }
 
 // TryAcquireFor 尝试获取账户槽位并立即返回当前结果
@@ -1173,19 +1252,32 @@ func (l *AccountLease) markAuthenticationStateAt(required bool, reason string, c
 		return nil
 	}
 	l.account.authCheckedAt = checkedAt
+	stateChanged := false
 	if !l.account.Config.Enabled {
+		stateChanged = l.account.State != AccountDisabled
 		l.account.State = AccountDisabled
 	} else if required {
+		stateChanged = l.account.State != AccountAuthRequired
 		l.account.State = AccountAuthRequired
 	} else if l.account.State == AccountAuthRequired {
 		l.account.State = AccountReady
+		stateChanged = true
 	}
+	messageChanged := false
 	if required {
-		l.account.stateMessage = strings.TrimSpace(reason)
+		message := strings.TrimSpace(reason)
+		messageChanged = l.account.stateMessage != message
+		l.account.stateMessage = message
 	} else if l.account.State == AccountReady {
+		messageChanged = l.account.stateMessage != ""
 		l.account.stateMessage = ""
 	}
-	l.pool.notifyLocked()
+	// 仅在状态或消息实际迁移时唤醒等待者:MarkAuthenticationValid
+	// 每请求推进 authCheckedAt,而调度筛选条件不依赖该时间戳,
+	// 无条件广播会在饱和期造成 W×O(池) 的惊群扫描噪声。
+	if stateChanged || messageChanged {
+		l.pool.notifyLocked()
+	}
 	return nil
 }
 
@@ -1203,6 +1295,38 @@ func (p *AccountPool) ModelAccessGeneration(accountID string) uint64 {
 	return account.modelAccessGeneration
 }
 
+// loadStorageStateLocked 返回账户持久认证状态;必须在持有
+// account.storageMu 时调用。磁盘内容未变(按 mtime+size 判定)时
+// 直接复用上次解析结果,返回携带独立底层数组的副本,调用方可
+// 安全原地修改(MergeSetCookieHeaders 会原地增删 Cookie)。
+// 租约内存续期间每个 RPC 2-5 次全量读盘+解析收敛为 0-1 次。
+func (a *Account) loadStorageStateLocked() (StorageState, error) {
+	if info, err := os.Stat(a.StoragePath); err == nil &&
+		a.storageCacheValid &&
+		info.ModTime().Equal(a.storageCacheModTime) && info.Size() == a.storageCacheSize {
+		return a.storageCache.clone(), nil
+	}
+	state, err := LoadStorageState(a.StoragePath)
+	if err != nil {
+		return StorageState{}, err
+	}
+	a.noteStorageStateLocked(state)
+	return state.clone(), nil
+}
+
+// noteStorageStateLocked 记录刚解析或刚落盘的持久状态;必须在持有
+// account.storageMu 时调用。写入方落盘后同步刷新 stat 记录,使同
+// 租约内的后续读取直接命中缓存。
+func (a *Account) noteStorageStateLocked(state StorageState) {
+	a.storageCache = state.clone()
+	a.storageCacheValid = false
+	if info, err := os.Stat(a.StoragePath); err == nil {
+		a.storageCacheModTime = info.ModTime()
+		a.storageCacheSize = info.Size()
+		a.storageCacheValid = true
+	}
+}
+
 // SaveStorageState 在租约内原子写回认证状态
 func (l *AccountLease) SaveStorageState(state StorageState) error {
 	if l == nil || l.account == nil || l.pool == nil {
@@ -1218,6 +1342,7 @@ func (l *AccountLease) SaveStorageState(state StorageState) error {
 	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
 		return err
 	}
+	l.account.noteStorageStateLocked(state)
 	l.pool.mu.Lock()
 	l.account.StorageState = state
 	l.pool.mu.Unlock()
@@ -1246,7 +1371,7 @@ func (l *AccountLease) RefreshStorageState(
 		l.authGeneration = currentGeneration
 		return nil
 	}
-	state, err := LoadStorageState(l.account.StoragePath)
+	state, err := l.account.loadStorageStateLocked()
 	if err != nil {
 		return err
 	}
@@ -1261,6 +1386,7 @@ func (l *AccountLease) RefreshStorageState(
 		finishCommit(false)
 		return err
 	}
+	l.account.noteStorageStateLocked(state)
 	l.pool.mu.Lock()
 	l.account.StorageState = state
 	l.account.authGeneration++
@@ -1349,7 +1475,7 @@ func (l *AccountLease) ReloadStorageState() (StorageState, error) {
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
-	state, err := LoadStorageState(l.account.StoragePath)
+	state, err := l.account.loadStorageStateLocked()
 	if err != nil {
 		return StorageState{}, err
 	}
@@ -1374,14 +1500,17 @@ func (l *AccountLease) ReplaceCookies(cookies []StateCookie) error {
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
-	state, err := LoadStorageState(l.account.StoragePath)
+	state, err := l.account.loadStorageStateLocked()
 	if err != nil {
 		return err
 	}
 	state.Cookies = append([]StateCookie(nil), cookies...)
-	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
+	// 租约内高频 Cookie 轮换:跳过 fsync,仅保留 rename 原子性;
+	// 断电回退由浏览器重新认证兑底。
+	if err := WriteStorageStateFast(l.account.StoragePath, state); err != nil {
 		return err
 	}
+	l.account.noteStorageStateLocked(state)
 	l.pool.mu.Lock()
 	l.account.StorageState = state
 	l.pool.mu.Unlock()
@@ -1469,16 +1598,18 @@ func (l *AccountLease) MergeSetCookieHeaders(headers []string, requestURL string
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
-	state, err := LoadStorageState(l.account.StoragePath)
+	state, err := l.account.loadStorageStateLocked()
 	if err != nil {
 		return err
 	}
 	if err := state.MergeSetCookieHeaders(headers, requestURL, now); err != nil {
 		return err
 	}
-	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
+	// 响应 Cookie 轮换同属高频路径:跳过 fsync 保留 rename 原子性。
+	if err := WriteStorageStateFast(l.account.StoragePath, state); err != nil {
 		return err
 	}
+	l.account.noteStorageStateLocked(state)
 	l.pool.mu.Lock()
 	l.account.StorageState = state
 	l.pool.mu.Unlock()
@@ -1626,9 +1757,15 @@ func (p *AccountPool) markModelAccessVerified(
 	_, cooling := account.runtime.Cooldowns[canonicalModelID]
 	globalAccess := account.runtime.ModelAccess[globalCooldownKey]
 	_, globalCooling := account.runtime.Cooldowns[globalCooldownKey]
+	// freshness 窗口:状态已为 verified 且无待清理冷却时,只要
+	// CheckedAt 未落后超过 modelAccessFreshness,就跳过整轮
+	// updateRuntime(全量读盘+落盘+fsync)。每次成功生成都携带
+	// 全新 checkedAt,不设窗口的话该路径每个请求都会执行;
+	// CheckedAt 不参与调度决策,轻微陈旧无副作用。
 	unchanged := generation == account.modelAccessGeneration && current.State == ModelAccessVerified &&
-		!cooling && !current.CheckedAt.Before(checkedAt) && !globalCooling &&
-		!globalAccess.CheckedAt.Before(checkedAt)
+		!cooling && !globalCooling &&
+		!current.CheckedAt.Before(checkedAt.Add(-modelAccessFreshness)) &&
+		!globalAccess.CheckedAt.Before(checkedAt.Add(-modelAccessFreshness))
 	p.mu.Unlock()
 	if unchanged {
 		return false, nil
@@ -2968,7 +3105,7 @@ func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection Ac
 		}
 		accounts = append(accounts, account)
 	}
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	var failures []error
 	for _, result := range p.refreshAccountRuntimes(ctx, accounts) {
 		if result.err == nil {
@@ -3052,14 +3189,21 @@ func acquireAccountFileLease(storagePath string) (*flock.Flock, string, error) {
 	}
 	accountDirectory := filepath.Dir(storagePath)
 	leaseDirectory := filepath.Join(filepath.Dir(accountDirectory), ".leases")
-	if err := os.MkdirAll(leaseDirectory, 0o700); err != nil {
-		return nil, "", fmt.Errorf("创建账户租约目录: %w", err)
-	}
 	leasePath := filepath.Join(leaseDirectory, filepath.Base(accountDirectory)+".lock")
+	// 直接尝试加锁:租约目录存在时省去每次获取租约都执行的
+	// MkdirAll 系统调用(该函数在池写锁内被调用,磁盘 I/O 会
+	// 串行化全池调度);首次部署目录缺失时补建后重试一次。
 	leaseLock := flock.New(leasePath)
 	locked, err := leaseLock.TryLock()
 	if err != nil {
-		return nil, leasePath, fmt.Errorf("锁定账户租约: %w", err)
+		if mkErr := os.MkdirAll(leaseDirectory, 0o700); mkErr != nil {
+			return nil, leasePath, fmt.Errorf("锁定账户租约: %w (创建租约目录: %v)", err, mkErr)
+		}
+		leaseLock = flock.New(leasePath)
+		locked, err = leaseLock.TryLock()
+		if err != nil {
+			return nil, leasePath, fmt.Errorf("锁定账户租约: %w", err)
+		}
 	}
 	if !locked {
 		return nil, leasePath, errAccountLeaseBusy

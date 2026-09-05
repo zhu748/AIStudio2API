@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyproto"
 	"golang.org/x/net/proxy"
 )
 
@@ -177,6 +178,52 @@ func TestSidecarPassesThroughNative(t *testing.T) {
 		if result != raw {
 			t.Fatalf("Ensure(%q) 应原样透传,得到 %q", raw, result)
 		}
+	}
+}
+
+// TestSidecarSingleflightWaitsForPending 验证并发 Ensure 同一链接时的
+// 单飞协调:已有启动者在 pending 中时,后续调用方等待其完成而不是
+// 竞争启动重复进程;启动者失败后等待方收到错误而非死锁。
+// 手工注入 pending 通道,不依赖 sing-box 二进制。
+func TestSidecarSingleflightWaitsForPending(t *testing.T) {
+	link := "vmess://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption=auto"
+	outbound, err := proxyproto.Parse(link)
+	if err != nil {
+		t.Fatalf("解析链接失败: %v", err)
+	}
+	key := outbound.Raw()
+
+	done := make(chan struct{})
+	registryMu.Lock()
+	pending[key] = done
+	registryMu.Unlock()
+	t.Cleanup(func() {
+		registryMu.Lock()
+		delete(pending, key)
+		registryMu.Unlock()
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		_, ensureErr := Ensure(link)
+		result <- ensureErr
+	}()
+
+	// 等待方应阻塞在 pending 上
+	select {
+	case err := <-result:
+		t.Fatalf("Ensure 不应在 pending 完成前返回: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(done)
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("启动者未成功时等待方应收到错误")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pending 关闭后 Ensure 未及时返回")
 	}
 }
 

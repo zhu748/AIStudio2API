@@ -158,7 +158,13 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("关闭 HTTP 服务: %w", err)
+			// 超时后强断残余连接并排干 Serve 返回值;
+			// SIGTERM 触发的退出不算服务失败,返回 nil 让进程
+			// 以 0(systemd/K8s 语义的成功停止)而非 1 退出。
+			manager.requests.log("service", "WARN", fmt.Sprintf("优雅退出超时,强制关闭连接 | 错误=%s", strings.TrimSpace(err.Error())))
+			_ = server.Close()
+			<-serveError
+			return nil
 		}
 		if err := <-serveError; err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err

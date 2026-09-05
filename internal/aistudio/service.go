@@ -13,10 +13,53 @@ import (
 	"time"
 )
 
+// modelsCacheTTL 是模型目录并集缓存的有效期。/v1/models 与管理端模型
+// 列表会被 SDK 与面板轮询,无 TTL 时每次调用都会放大为
+// “每就绪账号一次独占租约 + 上游 RPC”;30 秒窗口内直接返回缓存并集。
+const modelsCacheTTL = 30 * time.Second
+
 // PooledService 在账户租约内调用协议客户端
 type PooledService struct {
 	pool   *AccountPool
 	client *Client
+	// modelsCache 缓存 Models() 的并集结果(仅无租约上下文的调用方)。
+	// 并发刷新由 modelsRefresh 串行化,防止缓存过期瞬间多个轮询方
+	// 同时穿透到上游形成惊群。
+	modelsCache   modelsCache
+	modelsRefresh sync.Mutex
+}
+
+// modelsCache 保存 Models() 的最近一次成功结果。
+// models 切片构造后不再被修改,多请求并发只读是安全的。
+type modelsCache struct {
+	mu        sync.RWMutex
+	models    []Model
+	expiresAt time.Time
+}
+
+// snapshot 返回未过期的缓存快照。
+func (c *modelsCache) snapshot() ([]Model, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.models == nil || time.Now().After(c.expiresAt) {
+		return nil, false
+	}
+	return c.models, true
+}
+
+// store 写入缓存并刷新过期时间。
+func (c *modelsCache) store(models []Model, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.models = models
+	c.expiresAt = time.Now().Add(ttl)
+}
+
+// invalidate 清空缓存(账号模型目录主动刷新后调用)。
+func (c *modelsCache) invalidate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.models = nil
 }
 
 // PoolRequestContextProvider 从租约账户读取协议上下文
@@ -261,10 +304,22 @@ func (p *PoolRequestContextProvider) RequestContext(_ context.Context, accountID
 	return RequestContext{Timezone: timezone}, nil
 }
 
-// Models 刷新可用账户并返回实时模型并集
+// Models 刷新可用账户并返回实时模型并集。
+// 结果按 modelsCacheTTL 缓存:窗口内重复调用(常见于 SDK 轮询
+// /v1/models)直接返回缓存,不再逐账号抢占租约请求上游;
+// 过期后由 modelsRefresh 串行化刷新,并发调用方共享同一次结果。
 func (s *PooledService) Models(ctx context.Context) ([]Model, error) {
 	if lease, ok := AccountLeaseFromContext(ctx); ok {
 		return s.modelsForLease(ctx, lease)
+	}
+	if models, ok := s.modelsCache.snapshot(); ok {
+		return models, nil
+	}
+	s.modelsRefresh.Lock()
+	defer s.modelsRefresh.Unlock()
+	// 双检:排队期间已有并发调用方完成刷新
+	if models, ok := s.modelsCache.snapshot(); ok {
+		return models, nil
 	}
 	statuses := s.pool.Status()
 	targets := make([]AccountStatus, 0, len(statuses))
@@ -297,12 +352,15 @@ func (s *PooledService) Models(ctx context.Context) ([]Model, error) {
 		}
 		return nil, ErrNoEligibleAccount
 	}
+	s.modelsCache.store(models, modelsCacheTTL)
 	return models, nil
 }
 
 // RefreshAccountModels 刷新指定账户的权益与模型目录
 func (s *PooledService) RefreshAccountModels(ctx context.Context, accountID string) ([]Model, error) {
 	accountID = strings.TrimSpace(accountID)
+	// 主动刷新后作废并集缓存,让 /v1/models 与管理端立即看到新目录
+	defer s.modelsCache.invalidate()
 	lease, err := s.pool.AcquireAccount(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -598,8 +656,11 @@ func accountAttemptLimit(pool *AccountPool, pinned bool) int {
 		return 1
 	}
 	eligible := 0
-	for _, status := range pool.Status() {
-		if status.Enabled && (status.State == AccountReady || status.State == AccountBusy) {
+	// 热路径使用轻量视图:AccountOverviews 与 Status 的状态推导一致
+	// (TestAccountOverviewsMatchesStatusStates 锁定语义),但零模型
+	// 列表克隆与排序,避免每次请求都对全池做 O(A×M log M) 深拷贝。
+	for _, overview := range pool.AccountOverviews() {
+		if overview.Enabled && (overview.State == AccountReady || overview.State == AccountBusy) {
 			eligible++
 		}
 	}

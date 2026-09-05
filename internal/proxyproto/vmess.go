@@ -3,6 +3,7 @@ package proxyproto
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -26,8 +27,17 @@ func parseVMess(raw string) (*SidecarNode, error) {
 		return nil, fmt.Errorf("vmess 链接为空")
 	}
 	if strings.Contains(body, "@") {
-		if node, err := parseVMessURI(raw, body); err == nil {
+		node, err := parseVMessURI(raw, body)
+		if err == nil {
 			return node, nil
+		}
+		// 带 @ 也可能是 base64 形态(密文中含 @ 字符),URI 解析
+		// 失败不直接放弃;但把失败原因并入最终错误链,避免排障时
+		// 只看到误导性的 “不是有效的 base64” 报错。
+		if node, jsonErr := parseVMessJSON(raw, body); jsonErr == nil {
+			return node, nil
+		} else {
+			return nil, errors.Join(err, jsonErr)
 		}
 	}
 	return parseVMessJSON(raw, body)

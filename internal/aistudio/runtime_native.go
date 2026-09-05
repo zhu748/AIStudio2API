@@ -61,7 +61,11 @@ func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedReques
 		worker.fail(err)
 		return PreparedProtectedRequest{}, err
 	}
-	var payload []any
+	// 以 []json.RawMessage 解码:只扫结构不建树,请求体可达数 MB
+	// (含 base64 内联图片),旧 []any 方式会全量建树再重编——
+	// 双倍分配+延迟,且 map 重编会按字母序重排嵌套对象键,
+	// 破坏 wire 保真。此处仅在目标槽写入 proof,其余槽字节原样。
+	var payload []json.RawMessage
 	if err := json.Unmarshal(request.Body, &payload); err != nil {
 		worker.fail(err)
 		return PreparedProtectedRequest{}, fmt.Errorf("解析受保护请求: %w", err)
@@ -71,7 +75,12 @@ func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedReques
 		worker.fail(err)
 		return PreparedProtectedRequest{}, err
 	}
-	payload[request.ProofField-1] = proof
+	proofJSON, err := json.Marshal(proof)
+	if err != nil {
+		worker.fail(err)
+		return PreparedProtectedRequest{}, fmt.Errorf("编码 WAA proof: %w", err)
+	}
+	payload[request.ProofField-1] = proofJSON
 	body, err := json.Marshal(payload)
 	if err != nil {
 		worker.fail(err)

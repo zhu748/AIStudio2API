@@ -1,17 +1,11 @@
 import { readonly, ref } from 'vue'
-import { legacyLocales } from '@/legacy-locales'
+import { de, fr, ja, ko, zhTW } from '@/locales'
 import type { Locale } from '@/types'
 
 const zhCN = {
   'app.title': 'AI Studio 控制台',
-  'app.console': '控制台',
-  'app.gateway': '协议网关',
-  'app.online': '服务在线',
-  'app.offline': '服务离线',
-  'app.events': '实时事件',
   'app.reconnecting': '正在重连',
   'app.refresh': '刷新数据',
-  'app.version': '版本',
   'app.status': '服务状态',
   'app.start': '启动服务',
   'app.stop': '停止服务',
@@ -22,19 +16,9 @@ const zhCN = {
   'nav.settings': '服务配置',
   'nav.playground': 'API 试用',
   'section.accounts.title': '账户与登录',
-  'section.accounts.description': '管理登录状态、账户出口与模型可用性',
   'section.models.title': '实时模型目录',
-  'section.models.description': '来自健康账户的模型、方法与能力并集',
   'section.requests.title': '冷却与请求',
-  'section.requests.description': '查看账户模型冷却状态与当前请求',
   'section.settings.title': '服务配置',
-  'section.settings.description': '本地监听、鉴权、代理与超时',
-  'section.playground.title': 'API Playground',
-  'section.playground.description': '通过公开协议发送一次真实请求',
-  'metric.readyAccounts': '就绪账户',
-  'metric.activeRequests': '活动请求',
-  'metric.models': '可用模型',
-  'metric.totalAccounts': '账户总数',
   'common.loading': '加载中',
   'common.save': '保存',
   'common.cancel': '取消',
@@ -42,8 +26,6 @@ const zhCN = {
   'common.delete': '删除',
   'common.verify': '验证',
   'common.relogin': '重新登录',
-  'common.search': '搜索',
-  'common.add': '添加账户',
   'common.edit': '编辑',
   'common.enable': '启用',
   'common.disable': '停用',
@@ -51,10 +33,15 @@ const zhCN = {
   'common.copy': '复制',
   'common.copied': '已复制',
   'common.error': '请求失败',
-  'common.unknown': '未知',
+  'common.on': '开',
+  'common.off': '关',
+  'common.proxyInvalid': '代理格式无效：需为 http/https/socks5 URL（不含认证信息）或支持的分享链接',
+  'common.proxyInvalidScheme': '无法识别代理协议：支持 http/https/socks5 与 vless/vmess/trojan/ss/hysteria2/hysteria/tuic/anytls',
   'accounts.empty': '暂无账户',
   'accounts.emptyHint': '通过浏览器登录或从 Chrome 导入账户',
   'accounts.proxy': '账户代理',
+  'accounts.proxyHint': '留空则跟随全局默认代理（无则直连）；支持 http/https/socks5 与 vless/vmess/trojan/ss/hysteria2/hysteria/tuic/anytls 分享链接',
+  'accounts.followGlobal': '跟随全局代理',
   'accounts.locale': '语言区域',
   'accounts.timezone': '时区',
   'accounts.models': '模型',
@@ -81,20 +68,14 @@ const zhCN = {
   'logs.error': '错误',
   'models.search': '搜索模型、方法或能力',
   'models.allMethods': '全部方法',
-  'models.model': '模型',
   'models.methods': '方法',
   'models.capabilities': '能力',
   'models.context': '输入上限',
   'models.output': '输出上限',
-  'models.paid': 'Paid',
+  'models.paid': '付费',
   'models.empty': '当前没有可用模型',
   'requests.live': '进行中',
   'requests.history': '请求摘要',
-  'requests.id': '请求 ID',
-  'requests.account': '账户',
-  'requests.model': '模型',
-  'requests.started': '开始时间',
-  'requests.action': '操作',
   'requests.stop': '停止',
   'requests.empty': '当前没有请求',
   'cooldowns.title': '模型冷却',
@@ -104,6 +85,8 @@ const zhCN = {
   'settings.listen': '监听地址',
   'settings.apiKey': '本地 API 密钥',
   'settings.proxy': '默认代理',
+  'settings.proxyHint': '全局出口代理，留空则直连；支持 http/https/socks5 与 vless/vmess/trojan/ss/hysteria2/hysteria/tuic/anytls 分享链接',
+  'settings.durationHint': 'Go 时长格式，如 90s、2m、1h30m',
   'settings.initTimeout': '初始化超时',
   'settings.requestTimeout': '请求超时',
   'settings.warmWorkerLimit': '常驻 Worker 数',
@@ -128,7 +111,6 @@ const zhCN = {
   'playground.modeMusic': 'Lyria 音乐',
   'playground.model': '模型',
   'playground.system': '系统指令',
-  'playground.prompt': '用户消息',
   'playground.stream': '流式响应',
   'playground.reasoning': '思考强度',
   'playground.reasoningOff': '默认',
@@ -147,11 +129,9 @@ const zhCN = {
   'playground.stop': '停止生成',
   'playground.output': '输出',
   'playground.raw': '原始响应',
-  'playground.placeholder': '输入一条消息',
+  'playground.placeholderShortcut': '输入一条消息（Ctrl/⌘ + Enter 发送）',
   'playground.systemPlaceholder': '可选系统指令',
   'playground.waiting': '等待请求',
-  'playground.elapsed': '耗时',
-  'playground.status': 'HTTP 状态',
   'state.ready': '就绪',
   'state.busy': '忙碌',
   'state.cooldown': '冷却',
@@ -169,14 +149,8 @@ export type TranslationKey = keyof typeof zhCN
 
 const en: Record<TranslationKey, string> = {
   'app.title': 'AI Studio Console',
-  'app.console': 'Console',
-  'app.gateway': 'Protocol gateway',
-  'app.online': 'Service online',
-  'app.offline': 'Service offline',
-  'app.events': 'Live events',
   'app.reconnecting': 'Reconnecting',
   'app.refresh': 'Refresh data',
-  'app.version': 'Version',
   'app.status': 'Service status',
   'app.start': 'Start service',
   'app.stop': 'Stop service',
@@ -187,19 +161,9 @@ const en: Record<TranslationKey, string> = {
   'nav.settings': 'Service config',
   'nav.playground': 'API playground',
   'section.accounts.title': 'Accounts & login',
-  'section.accounts.description': 'Manage login state, account egress, and model availability',
   'section.models.title': 'Live model catalog',
-  'section.models.description': 'Models, methods, and capabilities from healthy accounts',
   'section.requests.title': 'Cooldowns & requests',
-  'section.requests.description': 'Inspect account model cooldowns and active requests',
   'section.settings.title': 'Service config',
-  'section.settings.description': 'Local listener, authentication, proxy, and timeouts',
-  'section.playground.title': 'API Playground',
-  'section.playground.description': 'Send one live request through a public protocol',
-  'metric.readyAccounts': 'Ready accounts',
-  'metric.activeRequests': 'Active requests',
-  'metric.models': 'Available models',
-  'metric.totalAccounts': 'Total accounts',
   'common.loading': 'Loading',
   'common.save': 'Save',
   'common.cancel': 'Cancel',
@@ -207,8 +171,6 @@ const en: Record<TranslationKey, string> = {
   'common.delete': 'Delete',
   'common.verify': 'Verify',
   'common.relogin': 'Log in again',
-  'common.search': 'Search',
-  'common.add': 'Add account',
   'common.edit': 'Edit',
   'common.enable': 'Enable',
   'common.disable': 'Disable',
@@ -216,10 +178,15 @@ const en: Record<TranslationKey, string> = {
   'common.copy': 'Copy',
   'common.copied': 'Copied',
   'common.error': 'Request failed',
-  'common.unknown': 'Unknown',
+  'common.on': 'ON',
+  'common.off': 'OFF',
+  'common.proxyInvalid': 'Invalid proxy: must be an http/https/socks5 URL (no credentials) or a supported share link',
+  'common.proxyInvalidScheme': 'Unsupported proxy scheme. Use http/https/socks5 or a vless/vmess/trojan/ss/hysteria2/hysteria/tuic/anytls share link',
   'accounts.empty': 'No accounts',
   'accounts.emptyHint': 'Log in with a browser or import accounts from Chrome',
   'accounts.proxy': 'Account proxy',
+  'accounts.proxyHint': 'Empty follows the global default proxy (direct when unset). Supports http/https/socks5 and vless/vmess/trojan/ss/hysteria2/hysteria/tuic/anytls share links',
+  'accounts.followGlobal': 'Follows default proxy',
   'accounts.locale': 'Locale',
   'accounts.timezone': 'Timezone',
   'accounts.models': 'Models',
@@ -246,7 +213,6 @@ const en: Record<TranslationKey, string> = {
   'logs.error': 'ERROR',
   'models.search': 'Search models, methods, or capabilities',
   'models.allMethods': 'All methods',
-  'models.model': 'Model',
   'models.methods': 'Methods',
   'models.capabilities': 'Capabilities',
   'models.context': 'Input limit',
@@ -255,11 +221,6 @@ const en: Record<TranslationKey, string> = {
   'models.empty': 'No models are currently available',
   'requests.live': 'In progress',
   'requests.history': 'Request summary',
-  'requests.id': 'Request ID',
-  'requests.account': 'Account',
-  'requests.model': 'Model',
-  'requests.started': 'Started',
-  'requests.action': 'Action',
   'requests.stop': 'Stop',
   'requests.empty': 'No current requests',
   'cooldowns.title': 'Model cooldowns',
@@ -269,6 +230,8 @@ const en: Record<TranslationKey, string> = {
   'settings.listen': 'Listen address',
   'settings.apiKey': 'Local API key',
   'settings.proxy': 'Default proxy',
+  'settings.proxyHint': 'Global egress proxy; empty means direct. Supports http/https/socks5 and vless/vmess/trojan/ss/hysteria2/hysteria/tuic/anytls share links',
+  'settings.durationHint': 'Go duration format, e.g. 90s, 2m, 1h30m',
   'settings.initTimeout': 'Init timeout',
   'settings.requestTimeout': 'Request timeout',
   'settings.warmWorkerLimit': 'Resident workers',
@@ -295,7 +258,6 @@ const en: Record<TranslationKey, string> = {
   'playground.modeMusic': 'Lyria music',
   'playground.model': 'Model',
   'playground.system': 'System instruction',
-  'playground.prompt': 'User message',
   'playground.stream': 'Stream response',
   'playground.reasoning': 'Reasoning effort',
   'playground.reasoningOff': 'Default',
@@ -314,11 +276,9 @@ const en: Record<TranslationKey, string> = {
   'playground.stop': 'Stop generation',
   'playground.output': 'Output',
   'playground.raw': 'Raw response',
-  'playground.placeholder': 'Enter a message',
+  'playground.placeholderShortcut': 'Enter a message (Ctrl/⌘ + Enter to send)',
   'playground.systemPlaceholder': 'Optional system instruction',
   'playground.waiting': 'Waiting for a request',
-  'playground.elapsed': 'Elapsed',
-  'playground.status': 'HTTP status',
   'state.ready': 'Ready',
   'state.busy': 'Busy',
   'state.cooldown': 'Cooldown',
@@ -332,87 +292,70 @@ const en: Record<TranslationKey, string> = {
   'state.failed': 'Failed',
 }
 
-const legacyKeyMap: Partial<Record<TranslationKey, string>> = {
-  'app.title': 'pageTitle',
-  'app.console': 'pageTitle',
-  'app.status': 'status.title',
-  'app.start': 'status.start',
-  'app.stop': 'status.stop',
-  'nav.logs': 'logs.title',
-  'nav.accounts': 'worker.title',
-  'nav.models': 'chat.model',
-  'nav.settings': 'nav.config',
-  'nav.playground': 'nav.playground',
-  'section.accounts.title': 'worker.title',
-  'section.models.title': 'chat.model',
-  'section.settings.title': 'config.title',
-  'section.playground.title': 'nav.playground',
-  'common.loading': 'status.loading',
-  'common.save': 'config.save',
-  'common.cancel': 'modal.cancel',
-  'common.delete': 'worker.delete',
-  'common.edit': 'account.edit',
-  'common.enable': 'account.enable',
-  'common.disable': 'account.disable',
-  'common.relogin': 'auth.relogin',
-  'accounts.editTitle': 'account.editTitle',
-  'logs.level': 'logs.level',
-  'logs.source': 'logs.source',
-  'logs.allSources': 'logs.allSources',
-  'logs.clear': 'logs.clear',
-  'logs.autoScroll': 'logs.autoScroll',
-  'logs.waiting': 'logs.waiting',
-  'logs.all': 'logs.all',
-  'logs.info': 'logs.info',
-  'logs.warn': 'logs.warn',
-  'logs.error': 'logs.error',
-  'models.model': 'chat.model',
-  'settings.proxy': 'config.httpProxy',
-  'playground.model': 'chat.model',
-  'playground.system': 'chat.systemPrompt',
-  'playground.prompt': 'chat.placeholder',
-  'playground.send': 'chat.send',
-  'playground.stop': 'chat.stop',
-  'playground.clear': 'chat.clear',
-  'playground.placeholder': 'chat.placeholder',
+// 完整字典优先级:zh-CN/en 内置,其余五语言来自 locales.ts
+// (Record<TranslationKey, string> 编译期锁定键完整性),
+// 运行时仍保留 en 兜底以防字典意外缺项。
+const dictionaries: Partial<Record<Locale, Record<TranslationKey, string>>> = {
+  'zh-TW': zhTW,
+  ja,
+  ko,
+  fr,
+  de,
 }
 
-export const availableLocales = (Object.keys(legacyLocales) as Locale[]).map((code) => ({
-  code,
-  label: legacyLocales[code].label,
-}))
+// 语言菜单展示项(与旧控制台的七语言保持一致)
+export const availableLocales: { code: Locale; label: string }[] = [
+  { code: 'zh-CN', label: '简体中文' },
+  { code: 'zh-TW', label: '繁體中文' },
+  { code: 'en', label: 'English' },
+  { code: 'ja', label: '日本語' },
+  { code: 'ko', label: '한국어' },
+  { code: 'fr', label: 'Français' },
+  { code: 'de', label: 'Deutsch' },
+]
 
-const savedLocale = window.localStorage.getItem('user_lang') as Locale | null
-const locale = ref<Locale>(
-  savedLocale !== null && availableLocales.some((item) => item.code === savedLocale)
-    ? savedLocale
-    : 'zh-CN',
-)
-
-// legacyTranslation 读取旧控制台的多语言文本
-function legacyTranslation(value: Locale, key: string): string | undefined {
-  let current: unknown = legacyLocales[value]
-  for (const part of key.split('.')) {
-    if (typeof current !== 'object' || current === null || !(part in current)) return undefined
-    current = (current as Record<string, unknown>)[part]
+// localStorage 在禁用存储的浏览器(如 Chrome “阻止所有 Cookie”、
+// 嵌入式 WebView)中读写会抛 SecurityError,模块顶层抛错会导致
+// 整个应用无法启动;失败时静默退回默认语言。
+function readSavedLocale(): Locale | null {
+  try {
+    const value = window.localStorage.getItem('user_lang')
+    return value !== null && availableLocales.some((item) => item.code === value)
+      ? (value as Locale)
+      : null
+  } catch {
+    return null
   }
-  return typeof current === 'string' ? current : undefined
 }
 
-// useI18n 提供旧控制台语言与新增字段翻译
+function persistLocale(value: Locale): void {
+  try {
+    window.localStorage.setItem('user_lang', value)
+  } catch {
+    // 存储被禁用:本次会话内语言仍生效,仅无法跨刷新保留
+  }
+}
+
+const savedLocale = readSavedLocale()
+const locale = ref<Locale>(savedLocale !== null ? savedLocale : 'zh-CN')
+
+// 恢复保存的语言时同步 <html lang>,避免刷新后 lang 属性
+// 停留在 index.html 的默认值(setLocale 只在切换时更新)。
+if (document.documentElement.lang !== locale.value) {
+  document.documentElement.lang = locale.value
+}
+
+// useI18n 提供全部七语言的完整翻译
 export function useI18n() {
   const t = (key: TranslationKey): string => {
     if (locale.value === 'zh-CN') return zhCN[key]
     if (locale.value === 'en') return en[key]
-    const legacyKey = legacyKeyMap[key]
-    return legacyKey === undefined
-      ? en[key]
-      : (legacyTranslation(locale.value, legacyKey) ?? en[key])
+    return dictionaries[locale.value]?.[key] ?? en[key]
   }
   const setLocale = (value: Locale): void => {
     locale.value = value
     document.documentElement.lang = value
-    window.localStorage.setItem('user_lang', value)
+    persistLocale(value)
   }
 
   return { availableLocales, locale: readonly(locale), setLocale, t }

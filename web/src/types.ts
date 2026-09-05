@@ -67,6 +67,13 @@ export interface AdminLog {
   message: string
 }
 
+// LogEntry 是日志进入前端 store 后的展示形态:
+// id 为单调递增序号(重放与实时共用),用作稳定的 v-for key,
+// 避免 2000 条上限裁剪头部时所有幸存行因 index 位移而整列重建。
+export interface LogEntry extends AdminLog {
+  id: number
+}
+
 export interface Model {
   id: string
   name: string

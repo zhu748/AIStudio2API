@@ -87,7 +87,7 @@ func normalizeOrigin(origin string) (string, error) {
 	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
 		return "", fmt.Errorf("签名来源必须是 HTTPS origin")
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" && parsed.Path != "/" {
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
 		return "", fmt.Errorf("签名来源必须是 HTTPS origin")
 	}
 	return parsed.Scheme + "://" + parsed.Host, nil

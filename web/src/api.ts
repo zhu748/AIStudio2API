@@ -57,42 +57,85 @@ async function responseErrorMessage(response: Response): Promise<string> {
   const body = await response.text()
   if (body === '') return response.statusText
 
-  const value: unknown = JSON.parse(body)
+  // 反向代理返回 HTML 错误页时 JSON.parse 会抛出晦涩的语法错误,
+  // 回退为原始文本,让用户看到真实的上游信息
+  let value: unknown
+  try {
+    value = JSON.parse(body)
+  } catch {
+    return body
+  }
   const message = pathValue(value, ['error', 'message'])
   return typeof message === 'string' ? message : body
 }
 
-// requestJSON 执行管理端 JSON 请求并保留服务端错误语义
-async function requestJSON<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers)
-  if (init?.body !== undefined) {
+// 管理端请求超时(毫秒):读操作 30s;服务启停/登录/导入等
+// 涉及浏览器或子进程的长操作放宽,防止挂起时 loading 永不结束。
+const READ_TIMEOUT_MS = 30_000
+const SERVICE_TIMEOUT_MS = 300_000
+const IMPORT_TIMEOUT_MS = 120_000
+
+// requestJSON 执行管理端 JSON 请求并保留服务端错误语义。
+// 默认叠加 30s 超时;长操作调用方显式传入更长时长。
+async function requestJSON<T>(
+  path: string,
+  init?: RequestInit & { timeoutMs?: number },
+): Promise<T> {
+  const { timeoutMs = READ_TIMEOUT_MS, ...rest } = init ?? {}
+  const headers = new Headers(rest?.headers)
+  if (rest?.body !== undefined) {
     headers.set('Content-Type', 'application/json')
   }
 
-  const response = await fetch(path, { ...init, headers })
+  const response = await fetch(path, {
+    ...rest,
+    headers,
+    // exactOptionalPropertyTypes 下 signal 需为 null 而非 undefined(语义等价于不设置)
+    signal: rest?.signal ?? (timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : null),
+  })
   if (!response.ok) {
     throw new ApiError(await responseErrorMessage(response), response.status)
   }
 
-  return (await response.json()) as T
+  // 200 空 body/非 JSON 时给出可读错误而非裸 SyntaxError
+  try {
+    return (await response.json()) as T
+  } catch {
+    throw new ApiError(`Invalid JSON response from ${path}`, response.status)
+  }
 }
 
 // requestCommand 执行无需响应体的管理写操作
-async function requestCommand(path: string, init: RequestInit): Promise<void> {
-  const headers = new Headers(init.headers)
-  if (init.body !== undefined) {
+async function requestCommand(
+  path: string,
+  init: RequestInit & { timeoutMs?: number },
+): Promise<void> {
+  const { timeoutMs = READ_TIMEOUT_MS, ...rest } = init
+  const headers = new Headers(rest.headers)
+  if (rest.body !== undefined) {
     headers.set('Content-Type', 'application/json')
   }
 
-  const response = await fetch(path, { ...init, headers })
+  const response = await fetch(path, {
+    ...rest,
+    headers,
+    // exactOptionalPropertyTypes 下 signal 需为 null 而非 undefined(语义等价于不设置)
+    signal: rest.signal ?? (timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : null),
+  })
   if (!response.ok) {
     throw new ApiError(await responseErrorMessage(response), response.status)
   }
 }
 
-// parseAdminEvent 校验单一事件流的事件外壳
+// parseAdminEvent 校验单一事件流的事件外壳;单帧损坏时丢弃该帧
+// 而不是让异常终止整个流回调
 function parseAdminEvent(raw: string): AdminEvent | undefined {
-  const value: unknown = JSON.parse(raw)
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
   if (typeof value !== 'object' || value === null || !('type' in value) || !('data' in value)) {
     return undefined
   }
@@ -123,6 +166,7 @@ export const api = {
     requestJSON<AccountResponse>('/api/accounts', {
       method: 'POST',
       body: JSON.stringify(input),
+      timeoutMs: SERVICE_TIMEOUT_MS,
     }),
   chromeImportProfiles: async () =>
     (await requestJSON<ChromeProfilesResponse>('/api/accounts/import/chrome')).profiles,
@@ -130,6 +174,7 @@ export const api = {
     requestJSON<AccountsResponse>('/api/accounts/import/chrome', {
       method: 'POST',
       body: JSON.stringify(input),
+      timeoutMs: IMPORT_TIMEOUT_MS,
     }),
   updateAccount: (id: string, draft: AccountDraft) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, {
@@ -139,11 +184,25 @@ export const api = {
   deleteAccount: (id: string) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   loginAccount: (id: string) =>
-    requestCommand(`/api/accounts/${encodeURIComponent(id)}/login`, { method: 'POST' }),
+    requestCommand(`/api/accounts/${encodeURIComponent(id)}/login`, {
+      method: 'POST',
+      timeoutMs: SERVICE_TIMEOUT_MS,
+    }),
   verifyAccount: (id: string) =>
-    requestCommand(`/api/accounts/${encodeURIComponent(id)}/verify`, { method: 'POST' }),
-  startService: () => requestJSON<ServiceStatus>('/api/control/start', { method: 'POST' }),
-  stopService: () => requestJSON<ServiceStatus>('/api/control/stop', { method: 'POST' }),
+    requestCommand(`/api/accounts/${encodeURIComponent(id)}/verify`, {
+      method: 'POST',
+      timeoutMs: SERVICE_TIMEOUT_MS,
+    }),
+  startService: () =>
+    requestJSON<ServiceStatus>('/api/control/start', {
+      method: 'POST',
+      timeoutMs: SERVICE_TIMEOUT_MS,
+    }),
+  stopService: () =>
+    requestJSON<ServiceStatus>('/api/control/stop', {
+      method: 'POST',
+      timeoutMs: IMPORT_TIMEOUT_MS,
+    }),
   clearLogs: () => requestCommand('/api/logs', { method: 'DELETE' }),
   saveConfig: (config: ServiceConfig) =>
     requestJSON<ServiceConfig>('/api/config', {
@@ -156,22 +215,55 @@ export const api = {
     }),
 }
 
-// openAdminEvents 建立唯一的管理状态 SSE 连接
+// openAdminEvents 建立唯一的管理状态 SSE 连接。
+// onOpen 在(重)连成功时触发;onError 在连接断开时触发。
+// 浏览器自动重连只覆盖网络层中断:服务端返回非 200(如反代
+// 502/503 HTML 错误页)时 EventSource 进入 CLOSED 不再自重连,
+// 这里主动按指数退避(1s→30s)重建连接,避免数据流永久死亡
+// 而界面停留在旧数据上。
 export function openAdminEvents(
   onEvent: (event: AdminEvent) => void,
   onOpen: () => void,
+  onError?: () => void,
 ): EventConnection {
-  const source = new EventSource('/api/events')
-  source.onopen = onOpen
-  source.onmessage = (message) => {
-    const event = parseAdminEvent(message.data)
-    if (event !== undefined) {
-      onEvent(event)
+  let source: EventSource | undefined
+  let retryTimer: number | undefined
+  let closed = false
+  let retryDelay = 1_000
+
+  const connect = () => {
+    source = new EventSource('/api/events')
+    source.onopen = () => {
+      retryDelay = 1_000
+      onOpen()
+    }
+    source.onerror = () => {
+      onError?.()
+      if (!closed && source?.readyState === EventSource.CLOSED) {
+        source.close()
+        source = undefined
+        retryTimer = window.setTimeout(connect, retryDelay)
+        retryDelay = Math.min(retryDelay * 2, 30_000)
+      }
+    }
+    source.onmessage = (message) => {
+      const event = parseAdminEvent(message.data)
+      if (event !== undefined) {
+        onEvent(event)
+      }
     }
   }
+  connect()
 
   return {
-    close: () => source.close(),
+    close: () => {
+      closed = true
+      if (retryTimer !== undefined) {
+        window.clearTimeout(retryTimer)
+        retryTimer = undefined
+      }
+      source?.close()
+    },
   }
 }
 
@@ -411,20 +503,38 @@ function waitForVideoPoll(signal: AbortSignal): Promise<void> {
   })
 }
 
+// Veo 轮询上限:2s × 300 = 10 分钟,防止服务端持续 queued
+// 时前端无限轮询;到达上限后抛出可读错误。
+const VIDEO_POLL_MAX_ATTEMPTS = 300
+
 async function completeVideo(
   response: Response,
   headers: Headers,
   signal: AbortSignal,
 ): Promise<{ status: number; chunk: PlaygroundChunk; raw: string }> {
-  let value: unknown = await response.json()
+  let value: unknown
+  try {
+    value = await response.json()
+  } catch {
+    throw new ApiError('Invalid video response', response.status)
+  }
   let state = videoState(value)
+  let attempts = 0
   while (state.status === 'queued') {
+    if (attempts >= VIDEO_POLL_MAX_ATTEMPTS) {
+      throw new ApiError('Video poll timed out', response.status)
+    }
+    attempts += 1
     await waitForVideoPoll(signal)
     const poll = await fetch(`/v1/videos/${encodeURIComponent(state.id)}`, { headers, signal })
     if (!poll.ok) {
       throw new ApiError(await responseErrorMessage(poll), poll.status)
     }
-    value = await poll.json()
+    try {
+      value = await poll.json()
+    } catch {
+      throw new ApiError('Invalid video poll response', poll.status)
+    }
     state = videoState(value)
   }
   if (state.status === 'failed') {
@@ -622,8 +732,13 @@ async function readEventStream(
         .join('\n')
 
       if (data !== '' && data !== '[DONE]') {
-        const value: unknown = JSON.parse(data)
-        onDelta(responseChunk(input, value), data)
+        // 单帧 JSON 损坏时跳过该帧,流式响应后续帧仍可继续解析
+        try {
+          const value: unknown = JSON.parse(data)
+          onDelta(responseChunk(input, value), data)
+        } catch {
+          onDelta(emptyChunk(), data)
+        }
       }
       boundary = buffer.indexOf('\n\n')
     }
